@@ -1,6 +1,9 @@
 import os
 import re
+import ast
 import json
+import time
+import operator
 import hmac
 import html
 import asyncio
@@ -42,12 +45,16 @@ FONTS = {
     "5": str.maketrans("0123456789", "⓪①②③④⑤⑥⑦⑧⑨"),
 }
 DIGITS = r"[0-9۰-۹𝟎-𝟗𝟶-𝟿⓪①②③④⑤⑥⑦⑧⑨]"
-CLOCK_RE = re.compile(rf"\s*⏰?\s*{DIGITS}{{1,2}}\s*:\s*{DIGITS}{{1,2}}\s*$")
+EMOJIS = "⏰⌚🕐🕑🕒🕓🕔🕕🕖🕗🕘🕙🕚🕛"
+CLOCK_RE = re.compile(rf"\s*[{EMOJIS}]?\s*{DIGITS}{{1,2}}\s*:\s*{DIGITS}{{1,2}}\s*$")
 
 state = {
     "enabled": True,
     "target": os.getenv("CLOCK_TARGET", "last_name"),
     "font": os.getenv("CLOCK_FONT", "2"),
+    "emoji": os.getenv("CLOCK_EMOJI", ""),  # خالی = بدون ایموجی
+    "afk": None,
+    "afk_seen": {},
     "last_text": None,
     "authorized": False,
     "step": "phone",  # phone | code | 2fa
@@ -99,14 +106,21 @@ def make_client(session: str = "") -> TelegramClient:
     c = TelegramClient(StringSession(session), API["id"], API["hash"])
     c.add_event_handler(
         commands,
-        events.NewMessage(outgoing=True, pattern=r"^\.(clock|ping|help)(?:\s+(.*))?$"),
+        events.NewMessage(
+            outgoing=True,
+            pattern=r"(?s)^\.(clock|ping|help|id|afk|del|type|calc|time)(?:\s+(.*))?$",
+        ),
+    )
+    c.add_event_handler(
+        afk_reply, events.NewMessage(incoming=True, func=lambda e: e.is_private)
     )
     return c
 
 
 # ───────────── clock ─────────────
 def clock_text() -> str:
-    return f"⏰ {datetime.now(TZ):%H:%M}".translate(FONTS.get(state["font"], FONTS["1"]))
+    t = f"{datetime.now(TZ):%H:%M}".translate(FONTS.get(state["font"], FONTS["1"]))
+    return f"{state['emoji']} {t}".strip()
 
 
 def strip_clock(s: str) -> str:
@@ -152,16 +166,98 @@ async def clock_loop():
 
 
 HELP = (
-    "دستورات:\n.clock on / off\n.clock name | bio\n.clock font 1-5\n.ping\n.help"
+    "دستورات:\n"
+    ".clock on | off | name | bio\n"
+    ".clock font 1-5\n"
+    ".clock emoji ⏰   (یا: .clock emoji off)\n"
+    ".ping\n.time\n.id (روی ریپلای = آیدی طرف)\n"
+    ".afk [دلیل]  /  .afk off\n"
+    ".del [تعداد]  (پیام‌های خودت رو پاک می‌کنه)\n"
+    ".type متن\n.calc 2*(3+4)"
 )
+
+OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
+    ast.FloorDiv: operator.floordiv, ast.USub: operator.neg,
+}
+
+
+def safe_calc(expr: str):
+    def ev(n):
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return n.value
+        if isinstance(n, ast.BinOp) and type(n.op) in OPS:
+            a, b = ev(n.left), ev(n.right)
+            if isinstance(n.op, ast.Pow) and abs(b) > 100:
+                raise ValueError("توان زیاد")
+            return OPS[type(n.op)](a, b)
+        if isinstance(n, ast.UnaryOp) and type(n.op) in OPS:
+            return OPS[type(n.op)](ev(n.operand))
+        raise ValueError("عبارت نامعتبر")
+    return ev(ast.parse(expr, mode="eval").body)
+
+
+async def safe_edit(event, text):
+    try:
+        await event.edit(text)
+    except Exception:  # noqa
+        pass
 
 
 async def commands(event):
-    cmd, arg = event.pattern_match.group(1), (event.pattern_match.group(2) or "").strip()
+    cmd = event.pattern_match.group(1)
+    arg = (event.pattern_match.group(2) or "").strip()
+
     if cmd == "ping":
-        await event.edit("pong 🏓")
+        t0 = time.perf_counter()
+        await event.edit("...")
+        await event.edit(f"pong 🏓 {int((time.perf_counter() - t0) * 1000)}ms")
+
     elif cmd == "help":
         await event.edit(HELP)
+
+    elif cmd == "time":
+        await event.edit(f"🕒 {datetime.now(TZ):%Y-%m-%d  %H:%M:%S}")
+
+    elif cmd == "id":
+        if event.is_reply:
+            r = await event.get_reply_message()
+            await event.edit(f"user: `{r.sender_id}`\nchat: `{event.chat_id}`")
+        else:
+            await event.edit(f"chat: `{event.chat_id}`")
+
+    elif cmd == "afk":
+        if arg == "off":
+            state["afk"] = None
+            await event.edit("برگشتم ✅")
+        else:
+            state["afk"], state["afk_seen"] = arg or "الان آفلاینم، بعداً جواب می‌دم", {}
+            await event.edit("حالت AFK روشن شد 🌙")
+
+    elif cmd == "del":
+        n = min(int(arg) if arg.isdigit() else 1, 100)
+        msgs = [m async for m in client.iter_messages(event.chat_id, from_user="me", limit=n + 1)]
+        await client.delete_messages(event.chat_id, msgs)
+
+    elif cmd == "type":
+        if not arg:
+            return
+        out = ""
+        for w in arg.split(" ")[:40]:
+            out = f"{out} {w}".strip()
+            await safe_edit(event, out + " ▌")
+            await asyncio.sleep(0.4)
+        await safe_edit(event, out)
+
+    elif cmd == "calc":
+        try:
+            await event.edit(f"{arg} = {safe_calc(arg)}")
+        except ZeroDivisionError:
+            await event.edit("تقسیم بر صفر 😅")
+        except Exception:  # noqa
+            await event.edit("عبارت نامعتبره")
+
     elif cmd == "clock":
         if arg == "on":
             state["enabled"], state["last_text"] = True, None
@@ -178,8 +274,27 @@ async def commands(event):
         elif arg.startswith("font") and arg.split()[-1] in FONTS:
             state["font"], state["last_text"] = arg.split()[-1], None
             await event.edit("فونت عوض شد ✅")
+        elif arg.startswith("emoji"):
+            e = arg[5:].strip()
+            await apply(False)
+            state["emoji"] = "" if e in ("", "off", "none") else e[:2]
+            state["last_text"] = None
+            await event.edit("ایموجی عوض شد ✅")
         else:
             await event.edit(HELP)
+
+
+async def afk_reply(event):
+    if not state["afk"] or not state["authorized"]:
+        return
+    sender = await event.get_sender()
+    if getattr(sender, "bot", False):
+        return
+    now = time.time()
+    if now - state["afk_seen"].get(event.sender_id, 0) < 900:  # هر ۱۵ دقیقه یه بار
+        return
+    state["afk_seen"][event.sender_id] = now
+    await event.reply(f"🌙 {state['afk']}")
 
 
 # ───────────── web panel ─────────────
@@ -239,6 +354,7 @@ async def status_page(msg="", ok=False):
 <option value="0" {sel('0', '1' if state['enabled'] else '0')}>ساعت خاموش</option></select>
 <select name="target"><option value="last_name" {sel('last_name', state['target'])}>نمایش در فامیلی</option>
 <option value="bio" {sel('bio', state['target'])}>نمایش در بیو</option></select>
+<select name="emoji">{''.join(f'<option value="{e}" {sel(e, state["emoji"])}>{e or "بدون ایموجی"}</option>' for e in ["", "⏰", "🕒", "⌚"])}</select>
 <select name="font">{''.join(f'<option value="{k}" {sel(k, state["font"])}>فونت {k}: {("12:34").translate(v)}</option>' for k, v in FONTS.items())}</select>
 <button>ذخیره</button></form>
 <form method="post" action="/logout"><button class="red">خروج از اکانت</button></form>"""
@@ -359,6 +475,7 @@ async def settings(request):
     state["enabled"] = data.get("enabled") == "1"
     state["target"] = data.get("target", "last_name")
     state["font"] = data.get("font", "2")
+    state["emoji"] = data.get("emoji", "")
     state["last_text"] = None
     if state["enabled"]:
         await apply(True)
