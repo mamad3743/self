@@ -1,3 +1,7 @@
 telethon==1.36.0
 aiohttp>=3.9
 tzdata
+gTTS>=2.5
+Pillow>=10
+arabic-reshaper>=3.0
+python-bidi>=0.4.2
