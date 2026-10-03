@@ -246,6 +246,8 @@ async def on_startup(app):
         if state["authorized"]:
             await features.set_me()
     log.info("authorized=%s", state["authorized"])
+    if state["authorized"]:
+        asyncio.create_task(features.notify_start())
     app["tasks"] = [
         asyncio.create_task(features.clock_loop()),
         asyncio.create_task(features.online_loop()),

@@ -3,6 +3,7 @@ import os
 import re
 import io
 import ast
+import json
 import time
 import socket
 import asyncio
@@ -35,7 +36,7 @@ cooldown = {}
 cache = OrderedDict()  # پیام‌های دریافتی پی‌وی برای ضد حذف
 action_tasks = {}
 FA2EN = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
-SKIP_PREFIXES = (".", "🌙", "🗑", "✏️", "🔔", "⚙️", "📖", "🤖", "📅", "🛡")
+SKIP_PREFIXES = (".", "🌙", "🗑", "✏️", "🔔", "⚙️", "📖", "🤖", "📅", "🛡", "🩺", "🔄")
 
 
 def C():
@@ -273,6 +274,9 @@ alias("comment", "comment", "کامنت")
 alias("mentionlog", "mention", "منشن")
 alias("antidel", "antidel", "ضدحذف")
 alias("about", "about", "درباره")
+alias("status", "status", "وضعیت")
+alias("backup", "backup", "پشتیبان")
+alias("restore", "restore", "بازیابی")
 
 CMD_PATTERN = (
     r"(?s)^\.(" + "|".join(re.escape(a) for a in sorted(ALIASES, key=len, reverse=True))
@@ -287,6 +291,118 @@ def help_text() -> str:
     return "\n".join(lines)
 
 
+SCHED_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})$")
+
+
+def parse_sched(text: str):
+    """'23:00-07:00' → (دقیقه‌ی شروع، دقیقه‌ی پایان) یا None."""
+    m = SCHED_RE.match((text or "").translate(FA2EN).strip())
+    if not m:
+        return None
+    h1, m1, h2, m2 = map(int, m.groups())
+    if not (0 <= h1 < 24 and 0 <= h2 < 24 and m1 < 60 and m2 < 60):
+        return None
+    return h1 * 60 + m1, h2 * 60 + m2
+
+
+def quiet_now(now=None) -> bool:
+    sch = parse_sched(CFG.get("afk_sched", ""))
+    if not sch or sch[0] == sch[1]:
+        return False
+    now = now or datetime.now(TZ)
+    cur = now.hour * 60 + now.minute
+    a, b = sch
+    return (a <= cur < b) if a < b else (cur >= a or cur < b)
+
+
+def fmt_duration(sec: float) -> str:
+    sec = int(sec)
+    d, r = divmod(sec, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    parts = []
+    if d:
+        parts.append(f"{d} روز")
+    if h:
+        parts.append(f"{h} ساعت")
+    parts.append(f"{m} دقیقه")
+    return " و ".join(parts)
+
+
+def memory_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:  # noqa
+        return None
+
+
+def storage_ok() -> bool:
+    d = os.path.dirname(core.SETTINGS_FILE) or "."
+    return os.path.isdir(d) and os.access(d, os.W_OK)
+
+
+async def c_status(event, arg):
+    head, _, rest = arg.partition(" ")
+    if head in ("اعلان", "notify"):
+        v = onoff(rest)
+        CFG["notify_restart"] = (not CFG["notify_restart"]) if v is None else v
+        save_settings()
+        return await event.edit("🔔 اعلان ریستارت " + ("روشن شد" if CFG["notify_restart"] else "خاموش شد"))
+    t0 = time.perf_counter()
+    try:
+        await C().get_me()
+        ping = f"{int((time.perf_counter() - t0) * 1000)}ms"
+        tg = f"وصل ✅ ({ping})"
+    except Exception:  # noqa
+        tg = "مشکل در اتصال ❌"
+    started = datetime.fromtimestamp(core.START_TIME, TZ)
+    mem = memory_mb()
+    on = [FEAT[k]["name"] for k, v in F.items() if v]
+    bot = (f"@{botpanel.BOT['username']} ✅" if botpanel.BOT["running"]
+           else ("توکن هست ولی وصل نیست ⚠️" if CFG["bot_token"] else "تنظیم نشده"))
+    lines = [
+        "🩺 وضعیت سلف",
+        "",
+        f"⏱ روشن بودن: {fmt_duration(time.time() - core.START_TIME)}",
+        f"🚀 شروع: {jalali_long()} {started:%H:%M}" if started.date() == datetime.now(TZ).date()
+        else f"🚀 شروع: {started:%Y-%m-%d %H:%M}",
+        f"🔄 تعداد ریستارت‌ها: {CFG['restarts']}",
+        f"🧠 حافظه: {mem:.0f} MB" if mem else "🧠 حافظه: نامشخص",
+        f"📡 تلگرام: {tg}",
+        f"🤖 بات پنل: {bot}",
+        f"💾 ذخیره‌سازی: {'Volume ✅' if storage_ok() else 'بدون Volume ⚠️ (بعد از ریدیپلوی تنظیمات می‌پره)'}",
+        f"🎛 قابلیت روشن: {len(on)} از {len(F)}" + (f"\n   {' ، '.join(on)}" if on else ""),
+        f"🔔 اعلان ریستارت: {'روشن' if CFG['notify_restart'] else 'خاموش'}",
+    ]
+    await event.edit("\n".join(lines))
+
+
+async def notify_start():
+    """بعد از هر ریستارت (وقتی وارد شده باشی) توی Saved Messages خبر می‌ده."""
+    CFG["restarts"] += 1
+    save_settings()
+    if not CFG["notify_restart"]:
+        return
+    try:
+        mem = memory_mb()
+        await C().send_message(
+            "me",
+            f"🔄 سلف روشن شد — {jalali_long()} {datetime.now(TZ):%H:%M}"
+            + (f"\n🧠 {mem:.0f} MB" if mem else "")
+            + ("" if storage_ok() else "\n⚠️ Volume نیست؛ تنظیمات بعد از ریدیپلوی می‌پره")
+            + "\n(خاموش کردن: .وضعیت اعلان off)")
+    except Exception as e:  # noqa
+        log.warning("restart notice failed: %r", e)
+
+
 def toggle_keys():
     return [f["key"] for f in FEATS if f["toggle"]]
 
@@ -299,9 +415,65 @@ def panel_text() -> str:
     return "\n".join(lines)
 
 
+THEMES = {"classic": "classic", "کلاسیک": "classic", "mono": "mono", "تکرنگ": "mono",
+          "تک‌رنگ": "mono", "plain": "plain", "ساده": "plain"}
+
+
+def options_text() -> str:
+    ttl = CFG["panel_ttl"]
+    n = len(CFG["panel_chats"])
+    return (
+        "🎛 گزینه‌های پنل\n\n"
+        f"⏱ حذف خودکار: {f'{ttl} ثانیه' if ttl else 'خاموش'}   (.پنل زمان 120)\n"
+        f"🔒 فقط چت‌های مجاز: {'روشن' if CFG['panel_restrict'] else 'خاموش'}   (.پنل محدود on)\n"
+        f"✅ چت‌های مجاز: Saved Messages + {n} چت   (.پنل اینجا)\n"
+        f"🎨 رنگ دکمه‌ها: {CFG['theme']}   (.پنل رنگ classic | mono | plain)\n"
+        f"🌙 ساعت سکوت: {CFG['afk_sched'] or 'خاموش'}   (.آفلاین ساعت 23:00-07:00)"
+    )
+
+
 async def c_panel(event, arg):
     a = arg.translate(FA2EN).lower().strip()
     keys = toggle_keys()
+    head, _, rest = a.partition(" ")
+    rest = rest.strip()
+
+    # گزینه‌های خود پنل
+    if head in ("تنظیمات", "options", "opts"):
+        return await safe_edit(event, options_text())
+    if head in ("زمان", "ttl"):
+        if not rest.isdigit():
+            return await safe_edit(event, "مثال: .پنل زمان 120   (0 = پاک نشه)")
+        CFG["panel_ttl"] = min(int(rest), 3600)
+        save_settings()
+        t = CFG["panel_ttl"]
+        return await safe_edit(event, f"⏱ پنل بعد از {t} ثانیه پاک می‌شه" if t else "⏱ حذف خودکار پنل خاموش شد")
+    if head in ("اینجا", "here"):
+        lst, cid = CFG["panel_chats"], event.chat_id
+        if cid in lst:
+            lst.remove(cid)
+            msg = "❌ این چت از چت‌های مجاز پنل حذف شد"
+        else:
+            lst.append(cid)
+            msg = "✅ این چت برای نمایش پنل مجاز شد"
+        save_settings()
+        if not CFG["panel_restrict"]:
+            msg += "\n(محدودیت خاموشه؛ با «.پنل محدود on» روشنش کن)"
+        return await safe_edit(event, msg)
+    if head in ("محدود", "restrict"):
+        v = onoff(rest)
+        CFG["panel_restrict"] = (not CFG["panel_restrict"]) if v is None else v
+        save_settings()
+        return await safe_edit(event, "🔒 پنل فقط توی Saved Messages و چت‌های مجاز نمایش داده می‌شه"
+                               if CFG["panel_restrict"] else "🔓 پنل توی همه‌ی چت‌ها مجازه")
+    if head in ("رنگ", "theme"):
+        th = THEMES.get(rest)
+        if not th:
+            return await safe_edit(event, "رنگ‌بندی: classic (سبز/قرمز/آبی) | mono (همه آبی) | plain (بدون رنگ)")
+        CFG["theme"] = th
+        save_settings()
+        return await safe_edit(event, f"🎨 رنگ‌بندی دکمه‌ها: {th}\nبا .پنل ببین")
+
     if a in ("off", "خاموش"):
         for k in F:
             F[k] = False
@@ -317,19 +489,44 @@ async def c_panel(event, arg):
         return await safe_edit(event, panel_text())
     if a in ("متن", "text"):
         return await safe_edit(event, panel_text())
-    res = await botpanel.send_panel()
+
     uname = botpanel.BOT.get("username")
-    if res == "ok":
-        await safe_edit(event, f"🎛 پنل رنگی توی @{uname} فرستاده شد 👆")
+    allowed = (not CFG["panel_restrict"]) or event.chat_id == state.get("me") or event.chat_id in CFG["panel_chats"]
+    if uname and allowed:  # حالت اصلی: پنل مستقیم توی همین چت (inline)
+        try:
+            results = await C().inline_query(uname, "panel")
+            if results:
+                sent = await results[0].click(event.chat_id)
+                await event.delete()
+                if CFG["panel_ttl"] > 0 and sent:
+                    asyncio.create_task(_delete_later(sent, CFG["panel_ttl"]))
+                return
+        except Exception as e:  # noqa
+            log.warning("inline panel failed: %r", e)
+    res = await botpanel.send_panel()  # جایگزین: ارسال توی چت خصوصی با بات
+    if res == "ok" and not allowed:
+        await safe_edit(event, f"🔒 این چت برای پنل مجاز نیست؛ پنل رو توی @{uname} فرستادم.\n(.پنل اینجا برای مجاز کردن)")
+    elif res == "ok":
+        await safe_edit(
+            event,
+            f"🎛 پنل رو توی @{uname} فرستادم.\n"
+            "برای اینکه مستقیم توی همین چت بیاد: @BotFather ← /setinline ← بات رو انتخاب کن ← یه متن بنویس.")
     elif res == "not_started":
         await safe_edit(event, f"اول توی @{uname} بزن Start، بعد دوباره .پنل رو بزن.")
     elif res in ("no_token", "no_me"):
         await safe_edit(
             event,
-            "بات پنل تنظیم نشده (توکن BotFather رو توی پنل وب بذار). فعلاً پنل متنی:\n\n" + panel_text(),
-        )
+            "بات پنل تنظیم نشده (توکن BotFather رو توی پنل وب بذار). فعلاً پنل متنی:\n\n" + panel_text())
     else:
         await safe_edit(event, f"خطا توی بات پنل: {res}\n\n" + panel_text())
+
+
+async def _delete_later(msg, secs):
+    await asyncio.sleep(secs)
+    try:
+        await msg.delete()
+    except Exception:  # noqa
+        pass
 
 
 async def c_help(event, arg):
@@ -391,6 +588,18 @@ async def c_clock(event, arg):
 
 
 async def c_afk(event, arg):
+    head, _, rest = arg.partition(" ")
+    if head in ("ساعت", "time", "schedule"):  # ساعت سکوت (آفلاین خودکار)
+        rest = rest.strip()
+        if rest.lower() in ("off", "خاموش", ""):
+            CFG["afk_sched"] = ""
+            save_settings()
+            return await event.edit("⏰ ساعت سکوت خاموش شد")
+        if not parse_sched(rest):
+            return await event.edit("مثال: .آفلاین ساعت 23:00-07:00")
+        CFG["afk_sched"] = rest.translate(FA2EN)
+        save_settings()
+        return await event.edit(f"⏰ بین {CFG['afk_sched']} خودکار آفلاین می‌شم 🌙")
     if arg.lower() in ("off", "خاموش"):
         F["afk"] = False
         msg = "برگشتم ✅"
@@ -933,26 +1142,115 @@ async def c_video(event, arg):
     )
 
 
+TGJU_PAGES = ["https://www.tgju.org/currency", "https://www.tgju.org/gold-chart", "https://www.tgju.org/coin"]
+TGJU_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0 Safari/537.36",
+    "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8",
+}
+ROW_TAG_RE = re.compile(r"<tr\b[^>]*data-market-nameslug=[^>]*>", re.I)
+SLUG_RE = re.compile(r"""data-market-nameslug=["']([^"']+)["']""", re.I)
+PRICE_RE = re.compile(r"""data-price=["']([^"']+)["']""", re.I)
+# emoji, نام، slug توی tgju، اسم‌های مجاز برای فیلتر
+RATE_ITEMS = [
+    ("💵", "دلار", "price_dollar_rl", ("usd", "dollar", "دلار")),
+    ("💶", "یورو", "price_eur", ("eur", "euro", "یورو")),
+    ("💷", "پوند", "price_gbp", ("gbp", "پوند")),
+    ("🇦🇪", "درهم امارات", "price_aed", ("aed", "درهم")),
+    ("🇹🇷", "لیر ترکیه", "price_try", ("try", "lir", "لیر")),
+    ("🥇", "طلای ۱۸ (هر گرم)", "geram18", ("gold", "طلا", "18")),
+    ("🏅", "مثقال طلا", "mesghal", ("mesghal", "مثقال")),
+    ("🪙", "سکه امامی", "sekee", ("coin", "سکه", "emami", "امامی")),
+    ("🪙", "سکه بهار آزادی", "sekeb", ("azadi", "بهار", "آزادی")),
+    ("🪙", "نیم سکه", "nim", ("nim", "نیم")),
+    ("🪙", "ربع سکه", "rob", ("rob", "ربع")),
+    ("🪙", "سکه گرمی", "gerami", ("gerami", "گرمی")),
+]
+_rates_cache = {"t": 0.0, "data": {}}
+
+
+def parse_tgju(page_html: str) -> dict:
+    """از جدول‌های tgju، slug → قیمت (ریال) رو درمیاره."""
+    out = {}
+    for tag in ROW_TAG_RE.findall(page_html):
+        s_, p_ = SLUG_RE.search(tag), PRICE_RE.search(tag)
+        if not (s_ and p_):
+            continue
+        num = re.sub(r"[^\d.]", "", p_.group(1).translate(FA2EN))
+        try:
+            out[s_.group(1)] = float(num)
+        except ValueError:
+            pass
+    return out
+
+
+async def get_tgju() -> dict:
+    if time.time() - _rates_cache["t"] < 30 and _rates_cache["data"]:
+        return _rates_cache["data"]
+
+    async def one(url):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), headers=TGJU_HEADERS) as s:
+                async with s.get(url) as r:
+                    r.raise_for_status()
+                    return parse_tgju((await r.content.read(3_000_000)).decode("utf-8", "ignore"))
+        except Exception as e:  # noqa
+            log.warning("tgju %s: %r", url, e)
+            return {}
+
+    merged = {}
+    for part in await asyncio.gather(*(one(u) for u in TGJU_PAGES)):
+        merged.update(part)
+    if not merged:
+        raise RuntimeError("tgju جواب نداد")
+    _rates_cache.update(t=time.time(), data=merged)
+    return merged
+
+
+def toman(rial: float) -> str:
+    return digits(f"{int(round(rial / 10)):,}")
+
+
 async def c_currency(event, arg):
     await event.edit("💱 ...")
-    base = (arg or "USD").upper().strip()
-    data = await http_json(f"https://open.er-api.com/v6/latest/{base}")
-    rates = data.get("rates") or {}
-    if not rates:
-        return await event.edit("کد ارز نامعتبره")
-    wanted = [c for c in ("USD", "EUR", "GBP", "TRY", "AED", "JPY", "IRR") if c != base]
-    lines = [f"💱 1 {base} =\n"]
-    for c in wanted:
-        if c in rates:
-            v = rates[c]
-            lines.append(f"• {c}: {v:,.2f}" if v >= 1 else f"• {c}: {v:.4f}")
-    lines.append("\n(نرخ ریال: رسمی/بین‌المللی، با بازار آزاد فرق داره)")
+    a = arg.translate(FA2EN).strip().lower()
+    amount = None
+    m = re.match(r"^([\d.,]+)\s+(.+)$", a)
+    if m:
+        try:
+            amount, a = float(m.group(1).replace(",", "")), m.group(2).strip()
+        except ValueError:
+            pass
+    sel = RATE_ITEMS
+    if a:
+        sel = [i for i in RATE_ITEMS if a in i[3] or a == i[2]]
+        if not sel:
+            return await event.edit("نام ارز/سکه رو نشناختم. مثال: .ارز دلار | .ارز 100 یورو | .ارز سکه")
     try:
-        cg = await http_json("https://api.coingecko.com/api/v3/simple/price",
-                             params={"ids": "bitcoin,ethereum", "vs_currencies": "usd"})
-        lines.append(f"\n₿ BTC: ${cg['bitcoin']['usd']:,}\nΞ ETH: ${cg['ethereum']['usd']:,}")
+        rates = await get_tgju()
     except Exception:  # noqa
-        pass
+        return await event.edit(
+            "⚠️ سایت tgju جواب نداد (ممکنه IP سرور رو بلاک کرده باشه یا ظاهر سایت عوض شده باشه).\n"
+            "نرخ بازار آزاد رو از https://www.tgju.org ببین.", link_preview=False)
+    lines = [f"💱 نرخ بازار آزاد — {digits(datetime.now(TZ).strftime('%H:%M'))}\n"]
+    for emoji, name, slug, _ in sel:
+        r = rates.get(slug)
+        if r is None:
+            continue
+        if amount:
+            lines.append(f"{emoji} {digits(f'{amount:g}')} {name} = {toman(amount * r)} تومان")
+        else:
+            lines.append(f"{emoji} {name}: {toman(r)} تومان")
+    if len(lines) == 1:
+        return await event.edit("برای این مورد قیمتی پیدا نشد")
+    if not a:
+        try:
+            cg = await http_json("https://api.coingecko.com/api/v3/simple/price",
+                                 params={"ids": "bitcoin,ethereum", "vs_currencies": "usd"})
+            lines.append(f"\n₿ BTC: ${cg['bitcoin']['usd']:,}\nΞ ETH: ${cg['ethereum']['usd']:,}")
+        except Exception:  # noqa
+            pass
+    lines.append("\nمنبع: tgju.org")
     await event.edit("\n".join(lines))
 
 
@@ -1133,6 +1431,34 @@ async def c_comment(event, arg):
     await event.edit(msg)
 
 
+async def c_backup(event, arg):
+    data = {"features": F, "cfg": {k: v for k, v in CFG.items() if k != "bot_token"}}
+    bio = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=1).encode())
+    bio.name = "self-settings.json"
+    await C().send_file("me", bio, caption="💾 پشتیبان تنظیمات سلف (بدون توکن بات)")
+    await event.edit("💾 پشتیبان توی Saved Messages ذخیره شد")
+
+
+async def c_restore(event, arg):
+    r = await event.get_reply_message() if event.is_reply else None
+    if not r or not r.document or (r.document.size or 0) > 1_000_000:
+        return await event.edit("روی فایل پشتیبان (self-settings.json) ریپلای کن")
+    try:
+        d = json.loads((await r.download_media(file=bytes)).decode())
+    except Exception:  # noqa
+        return await event.edit("فایل پشتیبان معتبر نیست")
+    n = 0
+    for k, v in (d.get("features") or {}).items():
+        if k in F and isinstance(v, bool):
+            F[k], n = v, n + 1
+    for k, v in (d.get("cfg") or {}).items():
+        if k in CFG and k != "bot_token" and isinstance(v, type(CFG[k])):
+            CFG[k], n = v, n + 1
+    save_settings()
+    await refresh()
+    await event.edit(f"♻️ {n} تنظیم بازیابی شد")
+
+
 HANDLERS = {
     "panel": c_panel, "help": c_help, "about": c_about, "ping": c_ping, "time": c_time,
     "date": c_date, "id": c_id, "clock": c_clock, "afk": c_afk, "del": c_del, "type": c_type,
@@ -1144,7 +1470,7 @@ HANDLERS = {
     "anim": c_anim, "cheat": c_cheat, "tts": c_tts, "video": c_video, "news": c_news,
     "music": c_music, "currency": c_currency, "logo": c_logo, "action": c_action,
     "online": c_online, "seen": c_seen, "comment": c_comment, "mentionlog": c_mentionlog,
-    "antidel": c_antidel,
+    "antidel": c_antidel, "backup": c_backup, "restore": c_restore, "status": c_status,
 }
 assert set(ALIASES.values()) == set(HANDLERS), set(ALIASES.values()) ^ set(HANDLERS)
 
@@ -1231,7 +1557,7 @@ async def private_in(event):
         await event.reply(msg)
         return
 
-    if F["afk"] and not cooled(("afk", uid), 900):
+    if (F["afk"] or quiet_now()) and not cooled(("afk", uid), 900):
         await event.reply(f"🌙 {CFG['afk_text']}")
 
 

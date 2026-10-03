@@ -1,7 +1,8 @@
 """پنل دکمه‌ای با بات تلگرام (Bot API) — دکمه‌های رنگی با فیلد style.
 
 رنگ‌ها: success = سبز (روشن)، danger = قرمز (خاموش)، primary = آبی (دستوری).
-فقط خودِ صاحب سلف می‌تونه از پنل استفاده کنه.
+فقط خودِ صاحب سلف می‌تونه از پنل استفاده کنه؛ بقیه پیام «این پنل برای شما نیست» می‌گیرن.
+حالت اینلاین: با .پنل توی هر چتی پنل ارسال می‌شه (باید inline mode بات توی BotFather روشن باشه).
 """
 import html
 import asyncio
@@ -32,7 +33,14 @@ async def call(session, token, method, **params):
 
 # ───────────── صفحه‌ها ─────────────
 def btn(text, data, style):
-    return {"text": text, "callback_data": data, "style": style}
+    """رنگ دکمه بر اساس تم: classic = رنگ‌های معنایی، mono = همه آبی، plain = بدون رنگ."""
+    b = {"text": text, "callback_data": data}
+    theme = CFG.get("theme", "classic")
+    if theme == "classic":
+        b["style"] = style
+    elif theme == "mono":
+        b["style"] = "primary"
+    return b
 
 
 def feat_style(f) -> str:
@@ -59,6 +67,7 @@ def main_keyboard() -> dict:
             for k in row
         ]
         rows.append(list(reversed(btns)))  # ردیف‌ها از راست به چپ
+    rows.append([btn("❌ بستن پنل", "x", "danger")])
     return {"inline_keyboard": rows}
 
 
@@ -76,7 +85,7 @@ def feat_keyboard(key) -> dict:
     rows = []
     if FEAT[key]["toggle"]:
         rows.append([btn("🔴 خاموش", f"t:{key}:0", "danger"), btn("🟢 روشن", f"t:{key}:1", "success")])
-    rows.append([btn("🔙 بازگشت", "m", "primary")])
+    rows.append([btn("🔙 بازگشت", "m", "primary"), btn("❌ بستن", "x", "danger")])
     return {"inline_keyboard": rows}
 
 
@@ -93,6 +102,8 @@ async def route(data):
     """(متن، کیبورد، پیام کوتاه) برای هر دکمه."""
     if data == "m":
         return main_text(), main_keyboard(), None
+    if data == "x":
+        return "🔒 پنل بسته شد. برای باز کردن دوباره: <code>.پنل</code>", {"inline_keyboard": []}, None
     kind, _, rest = data.partition(":")
     if kind == "f" and rest in FEAT:
         return feat_text(rest), feat_keyboard(rest), None
@@ -105,29 +116,55 @@ async def route(data):
 
 
 # ───────────── پردازش آپدیت‌ها ─────────────
-async def handle(session, token, update):
+NOT_YOURS = "این پنل برای شما نیست 🚫"
+
+
+def is_owner(user_id) -> bool:
     me = state.get("me")
-    if "callback_query" in update:
+    return bool(me) and user_id == me
+
+
+async def handle(session, token, update):
+    if "inline_query" in update:
+        q = update["inline_query"]
+        results = []
+        if is_owner(q["from"]["id"]):
+            results = [{
+                "type": "article",
+                "id": "panel",
+                "title": "⚙️ پنل سلف",
+                "description": "ارسال پنل دکمه‌ای توی این چت",
+                "input_message_content": {"message_text": main_text(), "parse_mode": "HTML"},
+                "reply_markup": main_keyboard(),
+            }]
+        await call(session, token, "answerInlineQuery", inline_query_id=q["id"],
+                   results=results, cache_time=0, is_personal=True)
+
+    elif "callback_query" in update:
         q = update["callback_query"]
-        if not me or q["from"]["id"] != me:
+        if not is_owner(q["from"]["id"]):  # هر کس غیر از خودت
             await call(session, token, "answerCallbackQuery", callback_query_id=q["id"],
-                       text="این پنل خصوصیه", show_alert=True)
+                       text=NOT_YOURS, show_alert=True)
             return
         text, kb, toast = await route(q.get("data", ""))
         await call(session, token, "answerCallbackQuery", callback_query_id=q["id"], text=toast)
-        msg = q.get("message") or {}
-        if not msg:
+        where = {}
+        if q.get("inline_message_id"):  # پنلی که توی چت دیگه‌ای فرستاده شده
+            where = {"inline_message_id": q["inline_message_id"]}
+        elif q.get("message"):
+            where = {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"]}
+        else:
             return
         try:
-            await call(session, token, "editMessageText", chat_id=msg["chat"]["id"],
-                       message_id=msg["message_id"], text=text, parse_mode="HTML",
-                       reply_markup=kb, link_preview_options={"is_disabled": True})
+            await call(session, token, "editMessageText", text=text, parse_mode="HTML",
+                       reply_markup=kb, link_preview_options={"is_disabled": True}, **where)
         except BotError as e:
             if "not modified" not in str(e):
                 raise
+
     elif "message" in update:
         msg = update["message"]
-        if me and msg.get("from", {}).get("id") == me:  # بقیه نادیده گرفته می‌شن
+        if is_owner(msg.get("from", {}).get("id")):  # بقیه نادیده گرفته می‌شن
             await call(session, token, "sendMessage", chat_id=msg["chat"]["id"],
                        text=main_text(), parse_mode="HTML", reply_markup=main_keyboard())
 
@@ -169,7 +206,7 @@ async def run():
                 offset = None
                 while CFG["bot_token"] == token:
                     ups = await call(s, token, "getUpdates", offset=offset, timeout=25,
-                                     allowed_updates=["message", "callback_query"])
+                                     allowed_updates=["message", "callback_query", "inline_query"])
                     for u in ups:
                         offset = u["update_id"] + 1
                         try:
