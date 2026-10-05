@@ -5,3 +5,5 @@ gTTS>=2.5
 Pillow>=10
 arabic-reshaper>=3.0
 python-bidi>=0.4.2
+PySocks>=1.7.1
+python-socks[asyncio]>=2.0.0

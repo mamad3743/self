@@ -16,6 +16,7 @@ from telethon.errors import (
 import core
 import features
 import botpanel
+import meow
 from core import F, CFG, FEATS, FONTS, state, log, save_settings, save_api, save_session
 
 TEMPLATE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
@@ -84,6 +85,8 @@ async def status_page(msg="", ok=False):
         bot = "⏳ توکن ثبت شده؛ در حال اتصال (یا توکن اشتباهه)"
     else:
         bot = "بات پنل تنظیم نشده. توکن رو از @BotFather بگیر و اینجا بذار."
+    proxy_note = (f"🌐 پروکسی: {html.escape(meow.mask_proxy(CFG['proxy']))} (بعد از ریستارت اعمال می‌شه)"
+                  if CFG.get("proxy") else "🌐 پروکسی: خاموش (روی Railway معمولاً لازم نیست)")
     body = f"""<h2>✅ وصل شدی</h2><p>{html.escape(me.first_name or '')}
 <small dir="ltr">@{html.escape(me.username or '-')}</small></p>
 <form method="post" action="/settings">{checks}
@@ -92,6 +95,8 @@ async def status_page(msg="", ok=False):
 <select name="font">{opts([(k, f"فونت {k}: {'12:34'.translate(v)}") for k, v in FONTS.items()], CFG['font'])}</select>
 <hr><small>{bot}</small>
 <input name="bot_token" placeholder="توکن بات پنل (BotFather)" dir="ltr" autocomplete="off">
+<hr><small>{proxy_note}</small>
+<input name="proxy" placeholder="پروکسی: socks5://user:pass@host:1080  (off = حذف)" dir="ltr" autocomplete="off">
 <button>ذخیره</button></form>
 <small>قابلیت‌های دستوری و پنل دکمه‌ای رنگی: توی تلگرام <b>.پنل</b> یا <b>.راهنما</b></small>
 <form method="post" action="/logout"><button class="red">خروج از اکانت</button></form>"""
@@ -214,6 +219,13 @@ async def settings(request):
     tok = data.get("bot_token", "").strip()
     if tok:
         CFG["bot_token"] = tok
+    prx = data.get("proxy", "").strip()
+    if prx.lower() in ("off", "-", "خاموش"):
+        CFG["proxy"] = ""
+    elif prx and meow.parse_proxy_link(prx):
+        CFG["proxy"] = prx
+    elif prx:
+        return await status_page("آدرس پروکسی معتبر نیست", ok=False)
     save_settings()
     await features.refresh()
     return await status_page("ذخیره شد", ok=True)
@@ -251,6 +263,8 @@ async def on_startup(app):
     app["tasks"] = [
         asyncio.create_task(features.clock_loop()),
         asyncio.create_task(features.online_loop()),
+        asyncio.create_task(features.auto_loop()),
+        asyncio.create_task(meow.supervisor()),
         asyncio.create_task(botpanel.run()),
     ]
 

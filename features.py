@@ -2,6 +2,7 @@
 import os
 import re
 import io
+import random
 import ast
 import json
 import time
@@ -27,6 +28,7 @@ from telethon.tl.functions.messages import SendReactionRequest, SetTypingRequest
 
 import core
 import botpanel
+import meow
 from core import (
     F, CFG, FEATS, FEAT, state, log, TZ, save_settings, digits,
     jalali_short, jalali_long, clock_text, strip_clock, strip_bio, profile_key,
@@ -275,11 +277,25 @@ alias("mentionlog", "mention", "منشن")
 alias("antidel", "antidel", "ضدحذف")
 alias("about", "about", "درباره")
 alias("status", "status", "وضعیت")
+alias("auto", "auto", "خودکار")
+alias("catch", "catch", "نجات", "autocatch")
+alias("meowie", "meowie", "میویی")
 alias("backup", "backup", "پشتیبان")
 alias("restore", "restore", "بازیابی")
+alias("automeow", "automeow", "میوخودکار")
+alias("autofish", "autofish", "ماهیگیر")
+alias("autofridge", "autofridge", "یخچالی")
+alias("autobat", "autobat", "خفاش")
+alias("show", "show", "نمایش")
+alias("sched", "sched", "زمانبندی")
+alias("alias", "alias", "الیاس", "میانبر")
+alias("proxy", "proxy", "پروکسی")
+alias("mstatus", "meowstatus", "meowhelp", "بازی")
+meow.RESERVED.update(ALIASES)  # اسم الیاس‌های کاربر نباید با دستورهای سلف یکی باشه
 
+SLASH_OK = {"automeow", "autofish", "autofridge", "autobat", "autocatch"}  # این‌ها با «/» هم کار می‌کنن
 CMD_PATTERN = (
-    r"(?s)^\.(" + "|".join(re.escape(a) for a in sorted(ALIASES, key=len, reverse=True))
+    r"(?is)^([./])(" + "|".join(re.escape(a) for a in sorted(ALIASES, key=len, reverse=True))
     + r")(?:\s+(.*))?$"
 )
 
@@ -351,6 +367,8 @@ def storage_ok() -> bool:
 
 async def c_status(event, arg):
     head, _, rest = arg.partition(" ")
+    if head in ("چت", "chat", "game", "بازی"):
+        return await event.edit(meow.status_text(event.chat_id))
     if head in ("اعلان", "notify"):
         v = onoff(rest)
         CFG["notify_restart"] = (not CFG["notify_restart"]) if v is None else v
@@ -960,25 +978,8 @@ async def c_unblock(event, arg):
 
 
 async def c_info(event, arg):
-    uid = await target_user(event, arg)
-    if uid is None:
-        return await event.edit("روی پیام اون شخص ریپلای کن یا یوزرنیم بده")
-    ent = await C().get_entity(uid)
-    full = await C()(GetFullUserRequest(ent))
-    fu = full.full_user
-    lines = [f"🆔 `{ent.id}`", f"👤 {dname(ent)}"]
-    if getattr(ent, "username", None):
-        lines.append(f"🔗 @{ent.username}")
-    if getattr(fu, "about", None):
-        lines.append(f"📝 {fu.about}")
-    if getattr(ent, "bot", False):
-        lines.append("🤖 بات")
-    if getattr(ent, "premium", False):
-        lines.append("⭐ پریمیوم")
-    cc_count = getattr(fu, "common_chats_count", None)
-    if cc_count is not None:
-        lines.append(f"👥 گروه مشترک: {cc_count}")
-    await event.edit("\n".join(lines))
+    text, _ = await meow.info_report(C(), event, arg)
+    await event.edit(text, parse_mode="html", link_preview=False)
 
 
 async def c_save(event, arg):
@@ -1431,11 +1432,303 @@ async def c_comment(event, arg):
     await event.edit(msg)
 
 
+# ───── کارهای زمان‌بندی‌شده (خودکار) ─────
+UNITS = {"s": 1, "ث": 1, "m": 60, "د": 60, "h": 3600, "س": 3600}
+MAX_TASKS, MIN_EVERY, MAX_EVERY = 10, 60, 86400
+task_next = {}
+task_fail = {}
+
+
+DUR_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(ساعت|دقیقه|ثانیه|hours?|hrs?|minutes?|mins?|seconds?|secs?)", re.I)
+DUR_UNIT = {"ساعت": 3600, "دقیقه": 60, "ثانیه": 1, "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
+            "minute": 60, "minutes": 60, "min": 60, "mins": 60, "second": 1, "seconds": 1, "sec": 1, "secs": 1}
+
+
+def parse_cooldown(text: str):
+    """زمان انتظار توی متن بات: «۲ دقیقه و ۳۰ ثانیه» ← 150 (جمع همه‌ی بخش‌ها)؛ نبود ← None."""
+    total, found = 0.0, False
+    for num, unit in DUR_RE.findall((text or "").translate(FA2EN)):
+        total += float(num.replace(",", ".")) * DUR_UNIT[unit.lower()]
+        found = True
+    return min(int(total), MAX_EVERY) if found and total > 0 else None
+
+
+async def read_cooldown(chat, after_id, wait=4.0):
+    """بعد از ارسال دستور، جواب بات رو می‌خونه و زمان انتظارش رو درمیاره."""
+    await asyncio.sleep(wait)
+    async for m in C().iter_messages(chat, limit=6, min_id=after_id):
+        if m.out:
+            continue
+        sec = parse_cooldown(m.raw_text or "")
+        if sec:
+            return sec
+    return None
+
+
+def parse_every(tok: str):
+    """'5m' | '30s' | '1h' | '5' (دقیقه) | '۵د' ← ثانیه؛ خارج از بازه ← None."""
+    m = re.match(r"^(\d+)\s*([a-zثدس]?)$", (tok or "").translate(FA2EN).lower())
+    if not m:
+        return None
+    sec = int(m.group(1)) * UNITS[m.group(2) or "m"]
+    return sec if MIN_EVERY <= sec <= MAX_EVERY else None
+
+
+def fmt_every(sec: int) -> str:
+    if sec % 3600 == 0:
+        return f"{sec // 3600} ساعت"
+    if sec % 60 == 0:
+        return f"{sec // 60} دقیقه"
+    return f"{sec} ثانیه"
+
+
+def task_line(t) -> str:
+    kind = "👆 کلیک" if t["kind"] == "click" else "💬 ارسال"
+    st = "🟢" if t.get("on", True) else "⏸"
+    smart = " 🧠" if t.get("smart") else ""
+    return f"{st} #{t['id']} {kind}{smart} «{t['text']}» هر {fmt_every(t['every'])}  (چت {t['chat']})"
+
+
+async def click_button(chat, text: str) -> bool:
+    """روی دکمه‌ای که متنش شامل text باشه (توی ۱۵ پیام آخر) کلیک می‌کنه."""
+    want = text.lower()
+    async for m in C().iter_messages(chat, limit=15):
+        for row in (m.buttons or []):
+            for b in row:
+                if want in (b.text or "").lower():
+                    await b.click()
+                    return True
+    return False
+
+
+async def run_task(t):
+    if t["kind"] == "click":
+        if not await click_button(t["chat"], t["text"]):
+            raise RuntimeError("دکمه پیدا نشد")
+        return None
+    return await C().send_message(t["chat"], t["text"])
+
+
+async def auto_tick(now=None):
+    """یک دور بررسی: کارهایی که وقتشون شده رو اجرا می‌کنه."""
+    if not (F["autotask"] and state["authorized"]):
+        return
+    now = now or time.time()
+    for t in list(CFG["autotasks"]):
+        if not t.get("on", True):
+            continue
+        nxt = task_next.setdefault(t["id"], now + 10 + (t["id"] % 5) * 3)
+        if now < nxt:
+            continue
+        task_next[t["id"]] = now + t["every"] + random.uniform(0, min(5, t["every"] * 0.05))
+        try:
+            sent = await run_task(t)
+            task_fail[t["id"]] = 0
+            if t.get("smart") and sent is not None:
+                cd = await read_cooldown(t["chat"], sent.id)
+                if cd:  # بات گفته چقدر صبر کنیم
+                    task_next[t["id"]] = now + max(cd + 3, 10)
+        except FloodWaitError as e:
+            task_next[t["id"]] = now + e.seconds + 5
+        except Exception as e:  # noqa
+            n = task_fail[t["id"]] = task_fail.get(t["id"], 0) + 1
+            log.warning("auto task #%s failed (%s): %r", t["id"], n, e)
+            if n >= 5:  # ۵ بار پشت‌سرهم خطا ← خاموش + خبر
+                t["on"] = False
+                save_settings()
+                try:
+                    await C().send_message("me", f"⚠️ کار خودکار #{t['id']} ({t['text']}) بعد از ۵ خطا متوقف شد: {e}")
+                except Exception:  # noqa
+                    pass
+        await asyncio.sleep(2)  # فاصله بین کارها
+
+
+async def auto_loop():
+    while True:
+        try:
+            await auto_tick()
+        except Exception as e:  # noqa
+            log.exception("auto loop: %s", e)
+        await asyncio.sleep(5)
+
+
+def add_task(chat, kind, text, every, smart=False):
+    tasks = CFG["autotasks"]
+    tid = max([t["id"] for t in tasks], default=0) + 1
+    task = {"id": tid, "chat": chat, "kind": kind, "text": text[:200], "every": every, "on": True}
+    if smart:
+        task["smart"] = True
+    tasks.append(task)
+    F["autotask"] = True
+    save_settings()
+    return tid
+
+
+AUTO_HELP = (
+    "⏲ کارهای زمان‌بندی‌شده\n\n"
+    "ارسال دستور: .خودکار افزودن 5m میو\n"
+    "حالت هوشمند (زمان انتظار رو از جواب بات می‌خونه): .خودکار هوشمند 5m میو\n"
+    "کلیک روی دکمه: .خودکار کلیک 10m ماهیگیری\n"
+    "واحد: s ثانیه | m دقیقه | h ساعت (حداقل 1m)\n"
+    ".خودکار لیست | توقف N | شروع N | اجرا N | حذف N | پاک"
+)
+
+
+async def c_auto(event, arg):
+    head, _, rest = arg.partition(" ")
+    head, rest = head.lower(), rest.strip()
+    tasks = CFG["autotasks"]
+    if head in ("", "لیست", "list"):
+        if not tasks:
+            return await event.edit("⏲ هیچ کاری ثبت نشده\n\n" + AUTO_HELP)
+        return await event.edit("⏲ کارها:\n" + "\n".join(task_line(t) for t in tasks))
+    if head in ("افزودن", "add", "کلیک", "click", "هوشمند", "smart"):
+        kind = "click" if head in ("کلیک", "click") else "send"
+        smart = head in ("هوشمند", "smart")
+        tok, _, text = rest.partition(" ")
+        sec, text = parse_every(tok), text.strip()
+        if not sec or not text:
+            return await event.edit(AUTO_HELP)
+        if len(tasks) >= MAX_TASKS:
+            return await event.edit(f"حداکثر {MAX_TASKS} کار مجازه؛ با .خودکار حذف N پاک کن")
+        tid = add_task(event.chat_id, kind, text, sec, smart)
+        extra = "\n🧠 اگه بات زمان انتظار بگه، نوبت بعدی همون موقع اجرا می‌شه" if smart else ""
+        return await event.edit(f"⏲ کار #{tid} ثبت شد: «{text}» هر {fmt_every(sec)} توی همین چت{extra}")
+    if head in ("پاک", "clear"):
+        before = len(tasks)
+        tasks[:] = [t for t in tasks if t["chat"] != event.chat_id]
+        save_settings()
+        return await event.edit(f"🧹 {before - len(tasks)} کار این چت پاک شد")
+    if head in ("حذف", "del", "delete", "توقف", "stop", "شروع", "start", "اجرا", "run") and rest.translate(FA2EN).isdigit():
+        tid = int(rest.translate(FA2EN))
+        t = next((x for x in tasks if x["id"] == tid), None)
+        if not t:
+            return await event.edit("کاری با این شماره نیست؛ .خودکار لیست")
+        if head in ("حذف", "del", "delete"):
+            tasks.remove(t)
+            msg = f"🗑 کار #{tid} حذف شد"
+        elif head in ("توقف", "stop"):
+            t["on"] = False
+            msg = f"⏸ کار #{tid} متوقف شد"
+        elif head in ("شروع", "start"):
+            t["on"], task_fail[tid] = True, 0
+            task_next.pop(tid, None)
+            F["autotask"] = True
+            msg = f"▶️ کار #{tid} شروع شد"
+        else:
+            try:
+                await run_task(t)
+                msg = f"✅ کار #{tid} اجرا شد"
+            except Exception as e:  # noqa
+                msg = f"⚠️ کار #{tid} خطا داد: {e}"
+        save_settings()
+        return await event.edit(msg)
+    await event.edit(AUTO_HELP)
+
+
+async def c_meowie(event, arg):
+    """آماده‌ساز بازی میویی: هر ۵ دقیقه «میو» توی این چت. .میویی هوشمند ← زمان انتظار رو از جواب بات می‌خونه."""
+    head, _, rest = arg.partition(" ")
+    if arg.lower() in ("off", "خاموش"):
+        return await c_auto(event, "پاک")
+    smart = head in ("هوشمند", "smart")
+    text = (rest.strip() if smart else arg) or "میو"
+    for t in CFG["autotasks"]:
+        if t["chat"] == event.chat_id and t["kind"] == "send" and t["text"] == text:
+            return await event.edit(f"کار «{text}» از قبل برای این چت ثبت شده (#{t['id']})")
+    tid = add_task(event.chat_id, "send", text, 300, smart)
+    await event.edit(
+        f"🐱 کار #{tid} ثبت شد: «{text}» هر ۵ دقیقه" + (" (🧠 هوشمند)" if smart else "") + ".\n"
+        "برای ماهیگیری/غذا دادن، همون متنی که توی بازی می‌فرستی رو بده:\n"
+        ".خودکار هوشمند 10m <متن دستور>\n.خودکار کلیک 10m <متن دکمه>")
+
+
+# ───── نجات خودکار (کلیک روی دکمه‌ی پیام‌های بات) ─────
+catch_seen = {}
+
+
+def find_button(message, word: str):
+    want = word.lower()
+    for row in (message.buttons or []):
+        for b in row:
+            if want in (b.text or "").lower():
+                return b
+    return None
+
+
+async def on_catch(event):
+    if not (F["autocatch"] and state["authorized"]):
+        return
+    cfg = CFG["catch"].get(str(event.chat_id))
+    m = event.message
+    if not cfg or m.out or not m.buttons:
+        return
+    key = (event.chat_id, m.id)
+    n = catch_seen.get(key, 0)
+    times = max(1, min(3, int(cfg.get("times", 2))))  # بدون تنظیم = رفتار قدیمی (حداکثر ۲ بار)
+    btn = find_button(m, cfg["word"])
+    if n >= times or not btn:  # هر پیام حداکثر «times» بار (برای ادیت‌ها)
+        return
+    catch_seen[key] = n + 1
+    while len(catch_seen) > 500:
+        catch_seen.pop(next(iter(catch_seen)))
+    delay = float(cfg.get("delay", 1.0))
+    if isinstance(event, events.MessageEdited.Event):
+        delay = max(2.0, delay)  # ادیت‌ها: بذار پیام جا بیفته
+    if delay > 0:
+        await asyncio.sleep(delay)
+    try:
+        await btn.click()
+        if "times" in cfg and times > 1 and n + 1 < times:  # کلیک پشت‌سرهم‌ی سریع (فقط اگه خودت «تعداد» رو تنظیم کردی)
+            async def _burst():
+                await asyncio.sleep(0.08)
+                try:
+                    await btn.click()
+                except Exception:  # noqa
+                    pass
+            asyncio.create_task(_burst())
+    except Exception as e:  # noqa
+        log.warning("auto catch click failed: %r", e)
+
+
+async def c_catch(event, arg):
+    allc, key = CFG["catch"], str(event.chat_id)
+    toks = arg.translate(FA2EN).split(maxsplit=1)
+    head = toks[0].lower() if toks else ""
+    rest = toks[1].strip() if len(toks) > 1 else ""
+    if head in ("off", "خاموش"):
+        allc.pop(key, None)
+        save_settings()
+        return await meow.reply(event, "🐈 نجات خودکار این چت خاموش شد")
+    cfg = allc.setdefault(key, {"word": "نجات", "delay": 1.0})
+    if head in ("کلمه", "word") and rest:
+        cfg["word"] = rest
+    elif head in ("تاخیر", "تأخیر", "delay"):
+        try:
+            d = float(rest)
+        except ValueError:
+            return await meow.reply(event, "مثال: .نجات تاخیر 1.5   (بین 0 تا 10 ثانیه)")
+        if not 0 <= d <= 10:
+            return await meow.reply(event, "تاخیر باید بین 0 تا 10 ثانیه باشه")
+        cfg["delay"] = d
+    elif head in ("تعداد", "times"):
+        if not rest.isdigit() or not 1 <= int(rest) <= 3:
+            return await meow.reply(event, "مثال: .نجات تعداد 2   (تعداد کلیک روی هر پیام/ادیت، بین 1 تا 3)")
+        cfg["times"] = int(rest)
+    F["autocatch"] = True
+    save_settings()
+    await meow.reply(
+        event,
+        f"🐈 نجات خودکار روشنه: دکمه‌ی شامل «{cfg['word']}» با {cfg['delay']:g} ثانیه تأخیر کلیک می‌شه"
+        f" (تعداد کلیک: {cfg.get('times', 2)})")
+
+
 async def c_backup(event, arg):
-    data = {"features": F, "cfg": {k: v for k, v in CFG.items() if k != "bot_token"}}
+    data = {"features": F, "cfg": {k: v for k, v in CFG.items() if k not in ("bot_token", "proxy")}}
     bio = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=1).encode())
     bio.name = "self-settings.json"
-    await C().send_file("me", bio, caption="💾 پشتیبان تنظیمات سلف (بدون توکن بات)")
+    await C().send_file("me", bio, caption="💾 پشتیبان تنظیمات سلف (بدون توکن بات و پروکسی)")
     await event.edit("💾 پشتیبان توی Saved Messages ذخیره شد")
 
 
@@ -1452,7 +1745,7 @@ async def c_restore(event, arg):
         if k in F and isinstance(v, bool):
             F[k], n = v, n + 1
     for k, v in (d.get("cfg") or {}).items():
-        if k in CFG and k != "bot_token" and isinstance(v, type(CFG[k])):
+        if k in CFG and k not in ("bot_token", "proxy") and isinstance(v, type(CFG[k])):
             CFG[k], n = v, n + 1
     save_settings()
     await refresh()
@@ -1471,13 +1764,20 @@ HANDLERS = {
     "music": c_music, "currency": c_currency, "logo": c_logo, "action": c_action,
     "online": c_online, "seen": c_seen, "comment": c_comment, "mentionlog": c_mentionlog,
     "antidel": c_antidel, "backup": c_backup, "restore": c_restore, "status": c_status,
+    "auto": c_auto, "meowie": c_meowie, "catch": c_catch,
+    "automeow": meow.c_automeow, "autofish": meow.c_autofish, "autofridge": meow.c_autofridge,
+    "autobat": meow.c_autobat, "show": meow.c_show, "sched": meow.c_sched, "alias": meow.c_alias,
+    "proxy": meow.c_proxy, "mstatus": meow.c_mstatus,
 }
 assert set(ALIASES.values()) == set(HANDLERS), set(ALIASES.values()) ^ set(HANDLERS)
 
 
 async def commands(event):
-    cmd = ALIASES[event.pattern_match.group(1)]
-    arg = (event.pattern_match.group(2) or "").strip()
+    prefix, name = event.pattern_match.group(1), event.pattern_match.group(2).lower()
+    if name not in ALIASES or (prefix == "/" and name not in SLASH_OK):
+        return
+    cmd = ALIASES[name]
+    arg = (event.pattern_match.group(3) or "").strip()
     try:
         await HANDLERS[cmd](event, arg)
     except Exception as e:  # noqa
@@ -1508,6 +1808,10 @@ async def auto_format(event):
     txt = m.raw_text or ""
     if not txt or m.media or m.entities or m.fwd_from or txt.startswith(SKIP_PREFIXES):
         return
+    if any(t["chat"] == event.chat_id for t in CFG["autotasks"]):
+        return  # دستورهای خودکار برای بات‌ها نباید ادیت/فرمت بشن
+    if meow.format_guard(event.chat_id, txt):
+        return  # چت‌های بازی میویی و پیام‌های زمان‌دار هم همین‌طور
     ent = FMT[CFG["fmt"]](0, len(txt.encode("utf-16-le")) // 2)
     try:
         await event.edit(txt, formatting_entities=[ent])
@@ -1675,7 +1979,8 @@ async def on_channel_post(event):
 
 
 def make_client(session: str = "") -> TelegramClient:
-    c = TelegramClient(StringSession(session), core.API["id"], core.API["hash"])
+    c = TelegramClient(StringSession(session), core.API["id"], core.API["hash"],
+                       **meow.proxy_kwargs(CFG.get("proxy") or os.getenv("PROXY", "")))
     c.add_event_handler(commands, events.NewMessage(outgoing=True, pattern=CMD_PATTERN))
     c.add_event_handler(auto_format, events.NewMessage(outgoing=True))
     c.add_event_handler(private_in, events.NewMessage(incoming=True, func=lambda e: e.is_private))
@@ -1687,6 +1992,14 @@ def make_client(session: str = "") -> TelegramClient:
     c.add_event_handler(
         on_group,
         events.NewMessage(incoming=True, func=lambda e: e.is_group))
+    c.add_event_handler(on_catch, events.NewMessage(incoming=True, func=lambda e: bool(e.message.buttons)))
+    c.add_event_handler(on_catch, events.MessageEdited(incoming=True, func=lambda e: bool(e.message.buttons)))
+    # بازی میویی (meow.py): جواب‌های بات، ادیت‌ها، خفاش و الیاس
+    c.add_event_handler(meow.on_incoming, events.NewMessage(incoming=True))
+    c.add_event_handler(meow.on_edit, events.MessageEdited(incoming=True))
+    c.add_event_handler(meow.on_bat, events.NewMessage(incoming=True))
+    c.add_event_handler(meow.on_manual_bat, events.NewMessage(outgoing=True))
+    c.add_event_handler(meow.alias_intercept, events.NewMessage(outgoing=True))
     c.add_event_handler(
         on_channel_post,
         events.NewMessage(incoming=True, func=lambda e: e.is_channel and not e.is_group))
