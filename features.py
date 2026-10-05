@@ -29,6 +29,7 @@ from telethon.tl.functions.messages import SendReactionRequest, SetTypingRequest
 import core
 import botpanel
 import meow
+import updater
 from core import (
     F, CFG, FEATS, FEAT, state, log, TZ, save_settings, digits,
     jalali_short, jalali_long, clock_text, strip_clock, strip_bio, profile_key,
@@ -291,6 +292,7 @@ alias("sched", "sched", "زمانبندی")
 alias("alias", "alias", "الیاس", "میانبر")
 alias("proxy", "proxy", "پروکسی")
 alias("mstatus", "meowstatus", "meowhelp", "بازی")
+alias("update", "update", "آپدیت", "بروزرسانی")
 meow.RESERVED.update(ALIASES)  # اسم الیاس‌های کاربر نباید با دستورهای سلف یکی باشه
 
 SLASH_OK = {"automeow", "autofish", "autofridge", "autobat", "autocatch"}  # این‌ها با «/» هم کار می‌کنن
@@ -407,6 +409,7 @@ async def notify_start():
     """بعد از هر ریستارت (وقتی وارد شده باشی) توی Saved Messages خبر می‌ده."""
     CFG["restarts"] += 1
     save_settings()
+    await updater.announce()
     if not CFG["notify_restart"]:
         return
     try:
@@ -1374,7 +1377,10 @@ def make_logo(text: str, style: int) -> bytes:
         basic = True
     except Exception:  # noqa
         pass
-    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DejaVuSans-Bold.ttf")
+    font_path = next((p for p in (
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DejaVuSans-Bold.ttf"),
+        os.path.join(os.environ.get("SELF_REPO_DIR", ""), "fonts", "DejaVuSans-Bold.ttf")) if os.path.isfile(p)),
+        "DejaVuSans-Bold.ttf")
     kw = {"layout_engine": ImageFont.Layout.BASIC} if basic else {}
     size = 220
     while True:
@@ -1752,6 +1758,83 @@ async def c_restore(event, arg):
     await event.edit(f"♻️ {n} تنظیم بازیابی شد")
 
 
+# ───── بروزرسانی با فایل ─────
+def update_file_ok(msg) -> bool:
+    """فقط فایلی که خودت مستقیم توی Saved Messages آپلود کردی (نه فوروارد، نه چت دیگران)."""
+    return bool(msg and msg.out and msg.document and not msg.fwd_from
+                and msg.chat_id == state.get("me"))
+
+
+def _fname(msg) -> str:
+    return (getattr(msg.file, "name", None) or "").strip()
+
+
+async def run_update(msg, reply_to):
+    name = _fname(msg)
+    if not name.lower().endswith((".zip", ".py")):
+        return
+    if (msg.document.size or 0) > updater.MAX_ZIP:
+        return await reply_to.reply("❌ فایل بیشتر از ۸ مگابایته")
+    status = await reply_to.reply("⏳ دارم فایل رو بررسی می‌کنم...")
+    tmpdir = tempfile.mkdtemp(prefix="selfdl_")
+    try:
+        path = await msg.download_media(file=os.path.join(tmpdir, "upload.bin"))
+        ok, text = await updater.apply(path, name)
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if not ok:
+        return await safe_edit(status, f"❌ بروزرسانی انجام نشد (هیچ تغییری اعمال نشد)\n{text}")
+    await safe_edit(status, text + "\n🔄 در حال ریستارت...")
+    await asyncio.sleep(1.5)
+    updater.restart()
+
+
+async def on_update_file(event):
+    """حالت خودکار: با روشن بودن کلید «بروزرسانی با فایل»."""
+    if not (F["update"] and state["authorized"]) or not update_file_ok(event.message):
+        return
+    if not _fname(event.message).lower().endswith((".zip", ".py")):
+        return
+    if updater.norm_name(_fname(event.message)) not in updater.ALLOWED and not _fname(event.message).lower().endswith(".zip"):
+        return  # یه .py معمولی (مثلاً اسکریپت خودت) رو دست نمی‌زنیم
+    await run_update(event.message, event.message)
+
+
+UPDATE_HELP = (
+    "🔄 بروزرسانی با فایل\n\n"
+    "• زیپ پروژه یا فایل‌های .py (main, core, features, meow, botpanel) رو توی Saved Messages آپلود کن.\n"
+    "• کلید «بروزرسانی با فایل» روشن باشه ← خودکار اعمال می‌شه؛ خاموش باشه ← روی فایل ریپلای کن و بنویس .آپدیت\n"
+    "• .آپدیت وضعیت | .آپدیت برگشت | .آپدیت پاک (برگشت به کد GitHub)\n"
+    "• اگه نسخه‌ی جدید بالا نیاد خودکار به قبلی برمی‌گرده."
+)
+
+
+async def c_update(event, arg):
+    head = arg.strip().lower()
+    if head in ("وضعیت", "status"):
+        return await event.edit(updater.status())
+    if head in ("برگشت", "rollback", "undo"):
+        msg = updater.restore_prev()
+        await event.edit(msg + "\n🔄 در حال ریستارت...")
+        await asyncio.sleep(1.5)
+        return updater.restart()
+    if head in ("پاک", "reset", "clear"):
+        msg = updater.reset()
+        await event.edit(msg + "\n🔄 در حال ریستارت...")
+        await asyncio.sleep(1.5)
+        return updater.restart()
+    if event.is_reply:
+        r = await event.get_reply_message()
+        if not update_file_ok(r):
+            return await event.edit("❌ فایل باید مستقیم توی Saved Messages خودت آپلود شده باشه (فوروارد یا فایل چت دیگه قبول نیست)")
+        if not _fname(r).lower().endswith((".zip", ".py")):
+            return await event.edit("❌ فقط .zip یا .py")
+        await event.edit("⏳ دارم فایل رو بررسی می‌کنم...")
+        return await run_update(r, event)
+    await event.edit(UPDATE_HELP + "\n\n" + updater.status())
+
+
 HANDLERS = {
     "panel": c_panel, "help": c_help, "about": c_about, "ping": c_ping, "time": c_time,
     "date": c_date, "id": c_id, "clock": c_clock, "afk": c_afk, "del": c_del, "type": c_type,
@@ -1767,7 +1850,7 @@ HANDLERS = {
     "auto": c_auto, "meowie": c_meowie, "catch": c_catch,
     "automeow": meow.c_automeow, "autofish": meow.c_autofish, "autofridge": meow.c_autofridge,
     "autobat": meow.c_autobat, "show": meow.c_show, "sched": meow.c_sched, "alias": meow.c_alias,
-    "proxy": meow.c_proxy, "mstatus": meow.c_mstatus,
+    "proxy": meow.c_proxy, "mstatus": meow.c_mstatus, "update": lambda e, a: c_update(e, a),
 }
 assert set(ALIASES.values()) == set(HANDLERS), set(ALIASES.values()) ^ set(HANDLERS)
 
@@ -2000,6 +2083,8 @@ def make_client(session: str = "") -> TelegramClient:
     c.add_event_handler(meow.on_bat, events.NewMessage(incoming=True))
     c.add_event_handler(meow.on_manual_bat, events.NewMessage(outgoing=True))
     c.add_event_handler(meow.alias_intercept, events.NewMessage(outgoing=True))
+    c.add_event_handler(on_update_file, events.NewMessage(
+        outgoing=True, func=lambda e: bool(e.message.document)))
     c.add_event_handler(
         on_channel_post,
         events.NewMessage(incoming=True, func=lambda e: e.is_channel and not e.is_group))

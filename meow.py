@@ -147,10 +147,10 @@ async def wait_reply(cid, sent_id, timeout):
     return None
 
 
-async def wait_buttons(cid, msg_id, timeout):
-    """منتظر ادیت پیام بات و اومدن دکمه‌ها؛ آخرش پیام فعلی رو می‌گیره."""
+async def wait_buttons(cid, msg_id, timeout, need=True):
+    """منتظر ادیت پیام بات (need=True دکمه، یا تابع شرط)؛ آخرش پیام فعلی رو می‌گیره."""
     fut = _fut()
-    _edit_w[(cid, msg_id)] = (fut, True)
+    _edit_w[(cid, msg_id)] = (fut, need)
     try:
         return await asyncio.wait_for(fut, timeout)
     except asyncio.TimeoutError:
@@ -193,10 +193,11 @@ def parse_clock_or_text(txt: str):
     mc = re.search(r"(\d+):(\d+)", t)
     if mc:
         return int(mc.group(1)) * 60 + int(mc.group(2))
+    hm = re.search(r"(\d+)\s*ساعت", t)
     mm = re.search(r"(\d+)\s*دقیقه", t)
     sm = re.search(r"(\d+)\s*ثانیه", t)
-    m_, s_ = (int(mm.group(1)) if mm else 0), (int(sm.group(1)) if sm else 0)
-    return m_ * 60 + s_ if (m_ or s_) else None
+    h_, m_, s_ = (int(x.group(1)) if x else 0 for x in (hm, mm, sm))
+    return h_ * 3600 + m_ * 60 + s_ if (h_ or m_ or s_) else None
 
 
 # ───────────── زمان‌دار روی سرور تلگرام ─────────────
@@ -392,34 +393,57 @@ def set_fish(cid, action, typ):
     save_settings()
 
 
-def parse_fish_cd(txt):
+FISH_CD_WORDS = ("صبر", "خوابن", "کولداون", "کافیه", "بعد", "دیگه", "مونده", "منتظر", "هنوز")
+
+
+def parse_fish_cd(txt, has_action_btn=False):
+    """زمان انتظار ماهیگیری از متن بات (هر قالبی: «۴۴ دقیقه»، «۱ ساعت و ۱۰ دقیقه»، «۴۴:۰۰»)."""
     t = num(txt)
-    if not any(k in t for k in ("صبر کنی", "خوابن", "کولداون", "کافیه")):
+    if has_action_btn:
         return None
     cd = parse_clock_or_text(t)
-    return cd if cd is not None else 300
+    if cd:
+        return min(cd, 6 * 3600)
+    if any(k in t for k in ("صبر کنی", "خوابن", "کولداون", "کافیه")):
+        return 300
+    return None
+
+
+def _has_fish_btn(msg, action) -> bool:
+    return bool(msg and msg.buttons and find_btn(msg, FISH_KW.get(action, "پیشی")))
 
 
 async def fish_act(cid, init, action) -> int:
-    """بعد از جواب بات به «ماهی»: دکمه‌ی مناسب رو می‌زنه؛ ثانیه‌ی نوبت بعدی رو برمی‌گردونه."""
-    cd = parse_fish_cd(init.raw_text or "")
-    if cd is not None:
-        return cd + 3
-    target = init if init.buttons else await wait_buttons(cid, init.id, 24)
-    if not (target and target.buttons):
-        return 60
+    """بعد از جواب بات به «ماهی»: یا کولداون رو می‌خونه یا دکمه‌ی مناسب رو می‌زنه؛ ثانیه‌ی نوبت بعدی رو برمی‌گردونه."""
+    cd = parse_fish_cd(init.raw_text or "", _has_fish_btn(init, action))
+    if cd:
+        return cd + random.randint(3, 9)
+    target = init
+    if not _has_fish_btn(init, action):
+        # بات ممکنه پیام رو بعداً ادیت کنه؛ منتظر دکمه یا متن کولداون می‌مونیم
+        target = await wait_buttons(
+            cid, init.id, 24,
+            need=lambda m: _has_fish_btn(m, action) or parse_fish_cd(m.raw_text or "") is not None)
+    if not target:
+        return 120
+    if not _has_fish_btn(target, action):
+        cd = parse_fish_cd(target.raw_text or "")
+        if cd:
+            return cd + random.randint(3, 9)
+        log.info("autofish: جواب بات قابل فهم نبود (نه دکمه نه زمان): %r", (target.raw_text or "")[:200])
+        return 120
     await asyncio.sleep(random.uniform(0.8, 1.6))
     btn = find_btn(target, FISH_KW.get(action, "پیشی"))
-    if btn:
-        if action == "fridge":
-            f_msg = await click_wait(btn, cid, target.id, 12, need_buttons=False, fallback=False)
-            if f_msg and any(k in (f_msg.raw_text or "") for k in ("جا نداره", "پر", "قبل", "موجود", "یخچال")):
-                s_btn = find_btn(f_msg, "فروش")  # یخچال پر بود ← جایگزین: فروش
-                if s_btn:
-                    await asyncio.sleep(1.0)
-                    await s_btn.click()
-        else:
-            await btn.click()
+    if action == "fridge":
+        f_msg = await click_wait(btn, cid, target.id, 12, need_buttons=False, fallback=False)
+        if f_msg and any(k in (f_msg.raw_text or "") for k in ("جا نداره", "پر", "قبل", "موجود", "یخچال")):
+            s_btn = find_btn(f_msg, "فروش")  # یخچال پر بود ← جایگزین: فروش
+            if s_btn:
+                await asyncio.sleep(1.0)
+                await s_btn.click()
+    else:
+        await btn.click()
+    # بعد از ماهیگیری، متن نهایی ممکنه زمان انتظار بعدی رو بگه؛ اگه نگفت، ۵ دقیقه و نوبت بعدی خودش کولداون رو می‌خونه
     return 300
 
 
@@ -796,7 +820,10 @@ async def on_edit(event):
     if not entry:
         return
     fut, need = entry
-    if not fut.done() and (not need or event.message.buttons):
+    if fut.done():
+        return
+    okk = need(event.message) if callable(need) else (not need or event.message.buttons)
+    if okk:
         fut.set_result(event.message)
 
 

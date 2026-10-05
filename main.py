@@ -1,4 +1,5 @@
 """پنل وب (ورود با شماره/کد) + راه‌اندازی سلف."""
+import boot  # noqa: F401  (باید اول باشه؛ نسخه‌ی بروزرسانی‌شده‌ی /data/code رو فعال می‌کنه)
 import os
 import hmac
 import html
@@ -17,6 +18,7 @@ import core
 import features
 import botpanel
 import meow
+import updater
 from core import F, CFG, FEATS, FONTS, state, log, save_settings, save_api, save_session
 
 TEMPLATE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
@@ -265,6 +267,7 @@ async def on_startup(app):
         asyncio.create_task(features.online_loop()),
         asyncio.create_task(features.auto_loop()),
         asyncio.create_task(meow.supervisor()),
+        asyncio.create_task(updater.mark_healthy()),
         asyncio.create_task(botpanel.run()),
     ]
 
