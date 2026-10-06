@@ -1,6 +1,11 @@
 """پنل وب (ورود با شماره/کد) + راه‌اندازی سلف."""
 import boot  # noqa: F401  (باید اول باشه؛ نسخه‌ی بروزرسانی‌شده‌ی /data/code رو فعال می‌کنه)
 import os
+
+if __name__ == "__main__" and os.environ.get("HUB_BOT_TOKEN"):
+    import hub  # حالت هاب: بات مشترک چندکاربره
+    hub.main()
+    raise SystemExit(0)
 import hmac
 import html
 import asyncio
@@ -19,6 +24,7 @@ import features
 import botpanel
 import meow
 import updater
+import ctl
 from core import F, CFG, FEATS, FONTS, state, log, save_settings, save_api, save_session
 
 TEMPLATE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
@@ -253,6 +259,7 @@ async def logout(request):
 async def on_startup(app):
     core.load_api()
     core.load_settings()
+    ctl.prepare()
     if core.API["id"] and core.API["hash"]:
         core.client = features.make_client(core.load_session())
         await core.client.connect()
@@ -270,6 +277,8 @@ async def on_startup(app):
         asyncio.create_task(updater.mark_healthy()),
         asyncio.create_task(botpanel.run()),
     ]
+    if ctl.CTL:
+        app["tasks"].append(asyncio.create_task(ctl.loop()))
 
 
 async def on_cleanup(app):

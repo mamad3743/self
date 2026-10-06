@@ -5,6 +5,7 @@
 تنظیمات توی CFG["meow"] ذخیره می‌شن (همون settings.json روی Volume).
 """
 import re
+import math
 import html
 import time
 import random
@@ -54,6 +55,7 @@ def M() -> dict:
     m.setdefault("autofish", {})  # {chat: {"action": feed|sell|fridge, "type": instant|schedule}}
     m.setdefault("autofridge", {})  # {chat: {"action": sell|feed, "type": instant|schedule}}
     m.setdefault("bat", {})  # {chat: {"on": bool, "delay": 0..115}}
+    m.setdefault("autocat", {})  # {chat: {"type": "instant"}} برداشت خودکار میو پوینت پیشی
     return m
 
 
@@ -207,7 +209,7 @@ _recent_sched = {}  # (chat, text) -> expiry؛ پیام‌های زمان‌دا
 def format_guard(chat_id, text="") -> bool:
     """True یعنی این پیام مال بازی/زمانبندیه و نباید فرمت (ادیت) بشه."""
     sc, m = str(chat_id), M()
-    if any(sc in m[k] for k in ("automeow", "autofish", "autofridge", "bat")) or sc in CFG.get("catch", {}):
+    if any(sc in m[k] for k in ("automeow", "autofish", "autofridge", "bat", "autocat")) or sc in CFG.get("catch", {}):
         return True
     exp = _recent_sched.get((chat_id, (text or "").strip()))
     return bool(exp and exp > time.time())
@@ -240,33 +242,19 @@ async def sched_send(cid, text, ts):
     await C().send_message(cid, text, schedule=dt)
 
 
-async def free_slots(cid, existing):
-    """صف زمان‌دار تلگرام ۱۰۰ تا جا داره؛ اگه نزدیک پر بود از میوهای اضافه پاک می‌کنیم."""
-    if len(existing) < 95:
-        return
-    meows = [m for m in existing if is_word(m, MEOW_WORDS)]
-    ids = [m.id for m in meows[90:]] or [m.id for m in meows[-5:]]
-    if ids:
-        try:
-            await C().delete_messages(cid, ids)
-        except Exception:  # noqa
-            pass
-
-
 # ───────────── میو خودکار ─────────────
-_main_cd = {}  # (chat) -> کولداون اصلی میو
+_main_cd = {}  # (chat) -> آخرین کولداون اصلی میو
 
 
-def meow_mode(cid):
-    v = M()["automeow"].get(str(cid)) or {}
-    return v.get("type", "off"), min(90, max(1, int(v.get("count", 1) or 1)))
+def meow_on(cid) -> bool:
+    return str(cid) in M()["automeow"]
 
 
-def set_meow(cid, typ, count=1):
-    if typ == "off":
-        M()["automeow"].pop(str(cid), None)
+def set_meow(cid, on: bool):
+    if on:
+        M()["automeow"][str(cid)] = {"type": "instant"}
     else:
-        M()["automeow"][str(cid)] = {"type": typ, "count": min(90, max(1, count))}
+        M()["automeow"].pop(str(cid), None)
     save_settings()
 
 
@@ -278,7 +266,7 @@ def parse_meow_cd(txt):
 
 
 async def meow_once(cid) -> int:
-    """یه میو می‌فرسته؛ ثانیه‌ی نوبت بعدی رو برمی‌گردونه."""
+    """یه میو می‌فرسته؛ ثانیه‌ی دقیق نوبت بعدی رو از جواب بات برمی‌گردونه."""
     sent = await send_safe(cid, random.choice(MEOW_WORDS))
     rep = await wait_reply(cid, sent.id, 28)
     if not rep:
@@ -286,19 +274,16 @@ async def meow_once(cid) -> int:
     txt = rep.raw_text or ""
     cd = parse_meow_cd(txt)
     if cd is None:
+        log.info("automeow: زمان انتظار توی جواب بات پیدا نشد: %r", txt[:200])
         return 255
     if "هنوز میوت نمیاد" not in txt:
         _main_cd[cid] = cd
     return cd
 
 
-def _buf(cd) -> int:
-    return random.randint(4, 9) if cd > 50 else 2
-
-
 async def meow_loop(cid):
     while True:
-        if not (F["automeow"] and meow_mode(cid)[0] == "instant"):
+        if not (F["automeow"] and meow_on(cid)):
             return
         try:
             async with chat_lock(cid):
@@ -308,92 +293,29 @@ async def meow_loop(cid):
         except Exception as e:  # noqa
             log.warning("automeow %s: %r", cid, e)
             cd = 60
-        await asyncio.sleep(cd + _buf(cd))
-
-
-async def schedule_next_meow(cid, remaining, main_cd, count):
-    count = min(90, max(1, count))
-    existing = await sched_list(cid)
-    mine = sorted((m for m in existing if is_word(m, MEOW_WORDS)), key=lambda m: m.date)
-    if len(mine) > 90:
-        try:
-            await C().delete_messages(cid, [m.id for m in mine[90:]])
-        except Exception:  # noqa
-            pass
-        mine = mine[:90]
-    needed = min(count - len(mine), 99 - len(existing))
-    if needed <= 0:
-        return
-    now = time.time()
-    if not mine:
-        ts = now + remaining + _buf(remaining)
-    else:
-        ts = max(max(m.date.timestamp() for m in mine) + main_cd + _buf(main_cd), now + remaining + _buf(remaining))
-    for _ in range(needed):
-        try:
-            await sched_send(cid, random.choice(MEOW_WORDS), ts)
-        except FloodWaitError as e:
-            log.warning("automeow schedule flood %ss", e.seconds)
-            break
-        except Exception as e:  # noqa
-            log.warning("automeow schedule error in %s: %r", cid, e)
-            break
-        ts += main_cd + _buf(main_cd)
-        await asyncio.sleep(0.4)
-
-
-async def _meow_sched_reply(event):
-    cid, txt = event.chat_id, event.raw_text or ""
-    cd = parse_meow_cd(txt)
-    if cd is None:
-        return
-    _, count = meow_mode(cid)
-    if "هنوز میوت نمیاد" in txt:
-        remaining, main = cd, _main_cd.get(cid, 255)
-    else:
-        _main_cd[cid] = main = remaining = cd
-    async with chat_lock(cid):
-        await schedule_next_meow(cid, remaining, main, count)
-
-
-async def meow_kick(cid):
-    """شروع/ترمیم زنجیره‌ی زمان‌دار: یه میوی فوری می‌فرسته تا کولداون رو بفهمیم و بقیه رو زمان‌دار می‌کنیم."""
-    _, count = meow_mode(cid)
-    async with chat_lock(cid):
-        have = [m for m in await sched_list(cid) if is_word(m, MEOW_WORDS)]
-        if len(have) >= count:
-            return
-        await send_safe(cid, random.choice(MEOW_WORDS))
-    await asyncio.sleep(35)  # on_incoming با جواب بات زنجیره رو ادامه می‌ده
-    if not F["automeow"] or meow_mode(cid)[0] != "schedule":
-        return
-    async with chat_lock(cid):  # بات جواب نداد؟ با زمان پیش‌فرض زمان‌دار کن
-        if not [m for m in await sched_list(cid) if is_word(m, MEOW_WORDS)]:
-            await schedule_next_meow(cid, 255, _main_cd.get(cid, 255), count)
+        await asyncio.sleep(cd + 1)  # دقیقاً همون زمانی که بات گفت (+۱ ثانیه برای اینکه زودتر نرسیم)
 
 
 # ───────────── ماهیگیری خودکار ─────────────
 FISH_KW = {"feed": "پیشی", "sell": "فروش", "fridge": "یخچال"}
 FISH_LABEL = {"feed": "غذادادن به پیشی 🐱", "sell": "فروش مستقیم ماهی 💰", "fridge": "ذخیره در یخچال 🧊"}
+_fish_streak = {}  # چند بار پشت‌سرهم بدون دیدن کولداون عمل کردیم (ترمز ایمنی)
 
 
 def fish_info(cid) -> dict:
     v = M()["autofish"].get(str(cid))
-    if not v:
-        return {"active": False, "action": "feed", "type": "off"}
-    return {"active": v.get("type") in ("instant", "schedule"), "action": v.get("action", "feed"),
-            "type": v.get("type", "instant")}
+    return {"active": bool(v), "action": (v or {}).get("action", "feed")}
 
 
-def set_fish(cid, action, typ):
-    if typ == "off":
-        M()["autofish"].pop(str(cid), None)
+def set_fish(cid, action, on: bool):
+    if on:
+        M()["autofish"][str(cid)] = {"action": action, "type": "instant"}
     else:
-        M()["autofish"][str(cid)] = {"action": action, "type": typ}
+        M()["autofish"].pop(str(cid), None)
     save_settings()
 
 
-FISH_CD_WORDS = ("صبر", "خوابن", "کولداون", "کافیه", "بعد", "دیگه", "مونده", "منتظر", "هنوز")
+FISH_CD_WORDS = ("صبر کنی", "خوابن", "کولداون", "کافیه")
 
 
 def parse_fish_cd(txt, has_action_btn=False):
@@ -404,7 +326,7 @@ def parse_fish_cd(txt, has_action_btn=False):
     cd = parse_clock_or_text(t)
     if cd:
         return min(cd, 6 * 3600)
-    if any(k in t for k in ("صبر کنی", "خوابن", "کولداون", "کافیه")):
+    if any(k in t for k in FISH_CD_WORDS):
         return 300
     return None
 
@@ -414,13 +336,15 @@ def _has_fish_btn(msg, action) -> bool:
 
 
 async def fish_act(cid, init, action) -> int:
-    """بعد از جواب بات به «ماهی»: یا کولداون رو می‌خونه یا دکمه‌ی مناسب رو می‌زنه؛ ثانیه‌ی نوبت بعدی رو برمی‌گردونه."""
+    """بعد از جواب بات به «ماهی»: یا زمان انتظار رو می‌خونه یا دکمه‌ی مناسب رو می‌زنه؛ ثانیه‌ی نوبت بعدی رو برمی‌گردونه.
+    بعد از زدن دکمه، چند ثانیه بعد دوباره «ماهی» می‌فرستیم تا بات زمان انتظار تصادفی بعدی رو بگه و دقیق همون‌قدر صبر کنیم."""
     cd = parse_fish_cd(init.raw_text or "", _has_fish_btn(init, action))
     if cd:
-        return cd + random.randint(3, 9)
+        _fish_streak[cid] = 0
+        return cd + 1
     target = init
     if not _has_fish_btn(init, action):
-        # بات ممکنه پیام رو بعداً ادیت کنه؛ منتظر دکمه یا متن کولداون می‌مونیم
+        # بات ممکنه پیام رو بعداً ادیت کنه؛ منتظر دکمه یا متن زمان انتظار می‌مونیم
         target = await wait_buttons(
             cid, init.id, 24,
             need=lambda m: _has_fish_btn(m, action) or parse_fish_cd(m.raw_text or "") is not None)
@@ -429,7 +353,8 @@ async def fish_act(cid, init, action) -> int:
     if not _has_fish_btn(target, action):
         cd = parse_fish_cd(target.raw_text or "")
         if cd:
-            return cd + random.randint(3, 9)
+            _fish_streak[cid] = 0
+            return cd + 1
         log.info("autofish: جواب بات قابل فهم نبود (نه دکمه نه زمان): %r", (target.raw_text or "")[:200])
         return 120
     await asyncio.sleep(random.uniform(0.8, 1.6))
@@ -443,14 +368,14 @@ async def fish_act(cid, init, action) -> int:
                 await s_btn.click()
     else:
         await btn.click()
-    # بعد از ماهیگیری، متن نهایی ممکنه زمان انتظار بعدی رو بگه؛ اگه نگفت، ۵ دقیقه و نوبت بعدی خودش کولداون رو می‌خونه
-    return 300
+    _fish_streak[cid] = _fish_streak.get(cid, 0) + 1
+    return 8 if _fish_streak[cid] < 3 else 120  # اگه بات هیچ‌وقت کولداون نگفت، اسپم نکنیم
 
 
 async def fish_loop(cid):
     while True:
         info = fish_info(cid)
-        if not (F["autofish"] and info["active"] and info["type"] == "instant"):
+        if not (F["autofish"] and info["active"]):
             return
         try:
             async with chat_lock(cid):
@@ -465,58 +390,20 @@ async def fish_loop(cid):
         await asyncio.sleep(sleep)
 
 
-async def schedule_next_fish(cid, remaining):
-    existing = await sched_list(cid)
-    mine = [m for m in existing if is_word(m, FISH_WORDS)]
-    now = time.time()
-    if remaining > 10 and mine:  # پیام‌هایی که قبل از تموم شدن کولداون زمان‌دار شدن
-        bad = [m.id for m in mine if m.date.timestamp() < now + remaining]
-        if bad:
-            try:
-                await C().delete_messages(cid, bad)
-            except Exception:  # noqa
-                pass
-            mine = [m for m in mine if m.id not in bad]
-    if mine:
-        return
-    await free_slots(cid, existing)
-    ts = now + remaining + (random.randint(3, 8) if remaining > 10 else 2)
-    try:
-        await sched_send(cid, random.choice(FISH_WORDS), ts)
-    except Exception as e:  # noqa
-        log.warning("autofish schedule error in %s: %r", cid, e)
-
-
-async def _fish_sched_reply(event):
-    cid = event.chat_id
-    info = fish_info(cid)
-    async with chat_lock(cid):
-        sleep = await fish_act(cid, event.message, info["action"])
-        await schedule_next_fish(cid, sleep)
-
-
-async def fish_kick(cid):
-    async with chat_lock(cid):
-        await schedule_next_fish(cid, 4)
-
-
 # ───────────── یخچال خودکار ─────────────
 FRIDGE_LABEL = {"sell": "پخت ماهی خام و فروش پخته‌ها 💰", "feed": "پخت ماهی خام و غذادادن به پیشی 🐱"}
 
 
 def fridge_info(cid) -> dict:
     v = M()["autofridge"].get(str(cid))
-    if not v:
-        return {"active": False, "action": "sell", "type": "off"}
-    return {"active": v.get("type") in ("instant", "schedule"), "action": v.get("action", "sell"),
-            "type": v.get("type", "instant")}
+    return {"active": bool(v), "action": (v or {}).get("action", "sell")}
 
 
-def set_fridge(cid, action, typ):
-    if typ == "off":
-        M()["autofridge"].pop(str(cid), None)
+def set_fridge(cid, action, on: bool):
+    if on:
+        M()["autofridge"][str(cid)] = {"action": action, "type": "instant"}
     else:
-        M()["autofridge"][str(cid)] = {"action": action, "type": typ}
+        M()["autofridge"].pop(str(cid), None)
     save_settings()
 
 
@@ -564,7 +451,7 @@ async def fridge_process(cid, fridge_msg, action) -> int:
                 cook_sec = int(m.group(1)) * 60 + int(m.group(2)) if m else 180
                 await asyncio.sleep(2.0)
                 await confirm.buttons[0][0].click()
-                return cook_sec + 60
+                return cook_sec + 3
             return 120
         return 1800
     return 1800
@@ -573,7 +460,7 @@ async def fridge_process(cid, fridge_msg, action) -> int:
 async def fridge_loop(cid):
     while True:
         info = fridge_info(cid)
-        if not (F["autofridge"] and info["active"] and info["type"] == "instant"):
+        if not (F["autofridge"] and info["active"]):
             return
         try:
             async with chat_lock(cid):
@@ -585,42 +472,89 @@ async def fridge_loop(cid):
         except Exception as e:  # noqa
             log.warning("autofridge %s: %r", cid, e)
             sleep = 60
-        await asyncio.sleep(max(sleep, 30))
+        await asyncio.sleep(max(sleep, 10))
 
 
-async def schedule_next_fridge(cid, remaining):
-    existing = await sched_list(cid)
-    mine = [m for m in existing if is_word(m, FRIDGE_WORDS)]
-    now = time.time()
-    if remaining > 10 and mine:
-        bad = [m.id for m in mine if m.date.timestamp() < now + remaining]
-        if bad:
-            try:
-                await C().delete_messages(cid, bad)
-            except Exception:  # noqa
-                pass
-            mine = [m for m in mine if m.id not in bad]
-    if mine:
-        return
-    await free_slots(cid, existing)
-    ts = now + remaining + (random.randint(3, 8) if remaining > 10 else 2)
+# ───────────── پیشی: برداشت خودکار میو پوینت ─────────────
+CAT_WORD = "پیشی"
+_cat_streak = {}
+
+
+def cat_on(cid) -> bool:
+    return str(cid) in M()["autocat"]
+
+
+def set_cat(cid, on: bool):
+    if on:
+        M()["autocat"][str(cid)] = {"type": "instant"}
+    else:
+        M()["autocat"].pop(str(cid), None)
+    save_settings()
+
+
+def _to_float(txt):
+    t = re.sub(r"[,٬،\s]", "", num(txt)).strip(".")
     try:
-        await sched_send(cid, "یخچال میویی", ts)
-    except Exception as e:  # noqa
-        log.warning("autofridge schedule error in %s: %r", cid, e)
+        return float(t)
+    except ValueError:
+        return None
 
 
-async def _fridge_sched_reply(event):
-    cid = event.chat_id
-    info = fridge_info(cid)
-    async with chat_lock(cid):
-        sleep = await fridge_process(cid, event.message, info["action"])
-        await schedule_next_fridge(cid, sleep)
+def parse_cat(txt):
+    """از پیام «پیشی»: (میو پوینت تولید‌شده، ظرفیت، تولید در ثانیه) ← یا None."""
+    t = num(txt or "")
+    out = []
+    for pat in (r"تولید\s*شده[^\d\n]{0,8}([\d,٬،.]+)", r"ظرفیت[^\d\n]{0,8}([\d,٬،.]+)",
+                r"در\s*ثانیه[^\d\n]{0,8}([\d,٬،.]+)"):
+        m = re.search(pat, t)
+        v = _to_float(m.group(1)) if m else None
+        if v is None:
+            return None
+        out.append(v)
+    return tuple(out)
 
 
-async def fridge_kick(cid):
-    async with chat_lock(cid):
-        await schedule_next_fridge(cid, 4)
+async def cat_act(cid, init) -> int:
+    """زمان پر شدن ظرفیت رو دقیق حساب می‌کنه؛ پر بود ← «برداشت میو پوینت ها» رو می‌زنه.
+    ثانیه‌ی نوبت بعدی رو برمی‌گردونه (بعد از برداشت چند ثانیه بعد دوباره می‌خونه تا زمان دقیق بعدی رو بفهمه)."""
+    target = init
+    if not parse_cat(init.raw_text):
+        target = await wait_buttons(cid, init.id, 20, need=lambda m: parse_cat(m.raw_text or "") is not None)
+    data = parse_cat(target.raw_text if target else "")
+    if not data:
+        log.info("autocat: اعداد توی جواب بات پیدا نشد: %r", ((target.raw_text if target else "") or "")[:300])
+        return 900
+    prod, cap, rate = data
+    if prod >= cap:
+        btn = find_btn(target, "برداشت")
+        if not btn:
+            log.info("autocat: ظرفیت پره ولی دکمه‌ی برداشت پیدا نشد")
+            return 120
+        await asyncio.sleep(random.uniform(0.8, 1.6))
+        await btn.click()
+        _cat_streak[cid] = _cat_streak.get(cid, 0) + 1
+        return 6 if _cat_streak[cid] < 3 else 300  # اگه برداشت جواب نداد، اسپم نکنیم
+    _cat_streak[cid] = 0
+    if rate <= 0:
+        return 900
+    return int(min(math.ceil((cap - prod) / rate), 86400)) + 2  # رو به بالا گرد می‌شه تا موقع بیدارشدن حتماً پر باشه
+
+
+async def cat_loop(cid):
+    while True:
+        if not (F["autocat"] and cat_on(cid)):
+            return
+        try:
+            async with chat_lock(cid):
+                sent = await send_safe(cid, CAT_WORD)
+                init = await wait_reply(cid, sent.id, 20)
+                sleep = await cat_act(cid, init) if init else 60
+        except FloodWaitError as e:
+            sleep = e.seconds + 5
+        except Exception as e:  # noqa
+            log.warning("autocat %s: %r", cid, e)
+            sleep = 60
+        await asyncio.sleep(sleep)
 
 
 # ───────────── شکار خفاش ─────────────
@@ -706,60 +640,43 @@ async def on_manual_bat(event):
             log.warning("manual bat failed: %r", e)
 
 
-# ───────────── مدیریت حلقه‌ها و ترمیم زنجیره‌ها ─────────────
-LOOPS = {"meow": meow_loop, "fish": fish_loop, "fridge": fridge_loop}
-KICKS = {"meow": meow_kick, "fish": fish_kick, "fridge": fridge_kick}
-SCHED_REPLY = {"meow": _meow_sched_reply, "fish": _fish_sched_reply, "fridge": _fridge_sched_reply}
-# kind: (کلید قابلیت، کلید تنظیمات، کلمه‌ها، مهلت بدون پیام زمان‌دار قبل از ترمیم)
-CHAINS = {
-    "meow": ("automeow", "automeow", MEOW_WORDS, 300),
-    "fish": ("autofish", "autofish", FISH_WORDS, 420),
-    "fridge": ("autofridge", "autofridge", FRIDGE_WORDS, 900),
-}
+# ───────────── مدیریت حلقه‌ها ─────────────
+LOOPS = {"meow": meow_loop, "fish": fish_loop, "fridge": fridge_loop, "cat": cat_loop}
+FIELDS = {"meow": ("automeow", "automeow"), "fish": ("autofish", "autofish"), "fridge": ("autofridge", "autofridge"),
+          "cat": ("autocat", "autocat")}
 TASKS = {}
-_empty = {}
-_last_watch = 0.0
+_migrated = False
 
 
 def _desired():
     out = set()
     if not state.get("authorized") or core.client is None:
         return out
-    for kind, (feat, field, _w, _g) in CHAINS.items():
+    for kind, (feat, field) in FIELDS.items():
         if F.get(feat):
-            for cid, v in M()[field].items():
-                if v.get("type") == "instant":
-                    out.add((kind, int(cid)))
+            for cid in M()[field]:
+                out.add((kind, int(cid)))
     return out
 
 
-async def _watch_chains():
-    """اگه صف زمان‌دار یه چت (حالت schedule) بیش از حد خالی بمونه، زنجیره رو دوباره راه می‌ندازه."""
-    global _last_watch
-    now = time.time()
-    if now - _last_watch < 120:
+async def _migrate():
+    """نسخه‌ی قبلی حالت «زمان‌دار» داشت؛ حالا همه خودکارِ لحظه‌ای‌ان. پیام‌های زمان‌دار قدیمی از سرور تلگرام پاک می‌شن."""
+    global _migrated
+    if _migrated:
         return
-    _last_watch = now
-    for kind, (feat, field, words, grace) in CHAINS.items():
-        if not F.get(feat):
-            continue
-        for cid_s, v in list(M()[field].items()):
-            if v.get("type") != "schedule":
-                continue
-            cid, key = int(cid_s), (kind, int(cid_s))
-            if chat_lock(cid).locked():
-                continue
-            if [m for m in await sched_list(cid) if is_word(m, words)]:
-                _empty.pop(key, None)
-                continue
-            if now - _empty.setdefault(key, now) >= grace:
-                _empty.pop(key, None)
-                log.info("%s: صف زمان‌دار چت %s خالیه؛ ترمیم زنجیره", kind, cid)
-                asyncio.create_task(KICKS[kind](cid))
+    _migrated, changed = True, False
+    for _kind, (field, words) in {"m": ("automeow", MEOW_WORDS), "f": ("autofish", FISH_WORDS),
+                                  "r": ("autofridge", FRIDGE_WORDS)}.items():
+        for cid, v in list(M()[field].items()):
+            if v.get("type") == "schedule":
+                v["type"], changed = "instant", True
+                await clear_sched(int(cid), words)
+    if changed:
+        save_settings()
 
 
 async def ensure():
-    """حلقه‌های لحظه‌ای رو با تنظیمات فعلی هماهنگ می‌کنه (شروع/توقف)."""
+    """حلقه‌ها رو با تنظیمات فعلی هماهنگ می‌کنه (شروع/توقف)."""
     want = _desired()
     for key in list(TASKS):
         if key not in want or TASKS[key].done():
@@ -771,9 +688,9 @@ async def ensure():
 async def supervisor():
     while True:
         try:
+            if state.get("authorized") and core.client is not None:
+                await _migrate()
             await ensure()
-            if state.get("authorized"):
-                await _watch_chains()
         except Exception as e:  # noqa
             log.exception("meow supervisor: %s", e)
         await asyncio.sleep(30)
@@ -781,38 +698,15 @@ async def supervisor():
 
 # ───────────── رویدادها ─────────────
 async def on_incoming(event):
-    """جواب‌های بات: آزاد کردن منتظرها + ادامه‌ی زنجیره‌ی حالت زمان‌دار."""
+    """جواب‌های بات به پیام‌های من ← آزاد کردن منتظرها."""
     if not state.get("authorized"):
         return
     rid = event.reply_to_msg_id
     if not rid:
         return
-    cid = event.chat_id
-    fut = _reply_w.get((cid, rid))
+    fut = _reply_w.get((event.chat_id, rid))
     if fut and not fut.done():
         fut.set_result(event.message)
-    sc, m = str(cid), M()
-    kinds = [k for k, (feat, field, _w, _g) in CHAINS.items()
-             if F.get(feat) and (m[field].get(sc) or {}).get("type") == "schedule"]
-    if not kinds:
-        return
-    try:
-        rep = await event.get_reply_message()
-    except Exception:  # noqa
-        return
-    if not rep or rep.sender_id != me_id():
-        return
-    txt = (rep.raw_text or "").strip()
-    for k in kinds:
-        if txt in CHAINS[k][2]:
-            asyncio.create_task(_guarded(SCHED_REPLY[k], event))
-
-
-async def _guarded(fn, event):
-    try:
-        await fn(event)
-    except Exception as e:  # noqa
-        log.warning("meow chain %s failed: %r", getattr(fn, "__name__", fn), e)
 
 
 async def on_edit(event):
@@ -1088,168 +982,138 @@ async def info_report(client, event, arg=""):
 # ───────────── وضعیت این چت ─────────────
 def status_text(cid) -> str:
     sc, m = str(cid), M()
-    mt, mc = meow_mode(cid)
-    meow = {"instant": "🟢 فعال (لحظه‌ای ⚡)", "schedule": f"🟢 فعال (زمان‌دار 📅 — {mc} پیام)"}.get(mt, "🔴 خاموش")
 
-    def line(info, labels):
-        if not info["active"]:
-            return "🔴 خاموش"
-        kind = "لحظه‌ای ⚡" if info["type"] == "instant" else "زمان‌دار 📅"
-        return f"🟢 فعال ({kind} — {labels.get(info['action'], info['action'])})"
+    def onoff(b, extra=""):
+        return ("🟢 روشن" + (f" ({extra})" if extra else "")) if b else "🔴 خاموش"
 
+    fi, ri = fish_info(cid), fridge_info(cid)
     c = CFG.get("catch", {}).get(sc)
-    catch = (f"🟢 فعال (کلمه: {c.get('word', 'نجات')} · تأخیر: {c.get('delay', 1.0):g}s · "
-             f"تعداد: {c.get('times', 2)})") if c else "🔴 خاموش"
+    catch = onoff(bool(c), f"کلمه: {c.get('word', 'نجات')} · تأخیر: {c.get('delay', 1.0):g}s · "
+                           f"تعداد: {c.get('times', 2)}" if c else "")
     b = m["bat"].get(sc)
-    bat = f"🟢 فعال (تأخیر: {b.get('delay', 1)}s)" if b and b.get("on") else "🔴 خاموش"
-    master = [k for k in ("automeow", "autofish", "autofridge", "autocatch", "autobat") if not F.get(k)]
+    bat = onoff(bool(b and b.get("on")), f"تأخیر: {b.get('delay', 1)}s" if b else "")
+    master = [k for k in ("automeow", "autofish", "autofridge", "autocat", "autocatch", "autobat") if not F.get(k)]
     warn = ("\n\n⚠️ کلید کلی این قابلیت‌ها توی پنل خاموشه: " + "، ".join(master)) if master else ""
     return (
         "🐾 **وضعیت بازی میویی توی این چت**\n\n"
         f"📍 چت: `{cid}`\n\n"
-        f"🐱 میو خودکار: {meow}\n"
-        f"🎣 ماهیگیری خودکار: {line(fish_info(cid), FISH_LABEL)}\n"
-        f"🧊 یخچال خودکار: {line(fridge_info(cid), FRIDGE_LABEL)}\n"
-        f"🐈 نجات خودکار: {catch}\n"
-        f"🦇 شکار خفاش: {bat}\n"
-        f"👁 حالت نمایش: {'🟢 روشن' if show_on() else '🔴 خاموش'}"
+        f"🐱 میویی: {onoff(meow_on(cid))}\n"
+        f"🎣 ماهیگیری: {onoff(fi['active'], FISH_LABEL[fi['action']] if fi['active'] else '')}\n"
+        f"🧊 یخچال: {onoff(ri['active'], FRIDGE_LABEL[ri['action']] if ri['active'] else '')}\n"
+        f"😺 پیشی (برداشت میو پوینت): {onoff(cat_on(cid))}\n"
+        f"🐈 نجات: {catch}\n"
+        f"🦇 خفاش: {bat}\n"
+        f"👁 حالت نمایش: {onoff(show_on())}"
         + warn
     )
 
 
-# ───────────── دستورها ─────────────
+# ───────────── دستورها (هر بازی یه دستور؛ بدون آرگومان = روشن/خاموش) ─────────────
 async def _enable(feat):
     F[feat] = True
     save_settings()
     await ensure()
 
 
-HELP_MEOW = (
-    "🐱 **میو خودکار**\n\n"
-    "▸ `.automeow instant` ← لحظه‌ای ⚡\n"
-    "▸ `.automeow schedule 5` ← زمان‌دار روی سرور تلگرام (۱ تا ۹۰ پیام؛ اکانت آنلاین نمی‌شه 🛡️)\n"
-    "▸ `.automeow off` ← خاموش\n"
-    "(فارسی: `.میوخودکار`  ·  می‌تونی `/automeow` هم بزنی)"
-)
-HELP_FISH = (
-    "🎣 **ماهیگیری خودکار**\n\n"
-    "▸ `.autofish feed schedule` ← زمان‌دار + غذا به پیشی\n"
-    "▸ `.autofish sell schedule` ← زمان‌دار + فروش مستقیم\n"
-    "▸ `.autofish fridge schedule` ← زمان‌دار + ذخیره در یخچال (پر بود ← فروش)\n"
-    "▸ `.autofish feed|sell|fridge instant` ← لحظه‌ای ⚡\n"
-    "▸ `.autofish off` ← خاموش\n"
-    "(فارسی: `.ماهیگیر`)"
-)
-HELP_FRIDGE = (
-    "🧊 **یخچال خودکار**\n\n"
-    "▸ `.autofridge sell schedule` ← پخت و فروش زمان‌دار\n"
-    "▸ `.autofridge feed schedule` ← پخت و غذا به پیشی زمان‌دار\n"
-    "▸ `.autofridge sell|feed instant` ← لحظه‌ای ⚡\n"
-    "▸ `.autofridge off` ← خاموش\n"
-    "(فارسی: `.یخچالی`)"
-)
-HELP_BAT = (
-    "🦇 **شکار خفاش**\n\n"
-    "▸ `.autobat on` / `.autobat off` ← خودکار توی این چت\n"
-    "▸ `.autobat delay 2` ← تأخیر ارسال ایموجی (۰ تا ۱۱۵ ثانیه)\n"
-    "▸ `.autobat list` ← جدول کد ← ایموجی\n"
-    "✋ دستی: روی پیام خفاش ریپلای کن و بنویس `batt`\n"
-    "(فارسی: `.خفاش`)"
-)
+ON_WORDS = {"on", "روشن", "start", "شروع", "instant", "live", "فوری", "schedule", "sched", "زمان‌دار", "زماندار"}
+OFF_WORDS = {"off", "خاموش", "stop", "توقف"}
+
+HELP_MEOW = ("🐱 **میویی** ← `.میویی` روشن/خاموش می‌کنه. زمان انتظار رو از جواب بات می‌خونه و دقیق همون موقع "
+             "خودش می‌فرسته.\n(`.میویی روشن` · `.میویی خاموش`)")
+HELP_FISH = ("🎣 **ماهیگیری** ← `.ماهیگیری` روشن/خاموش می‌کنه.\n"
+             "انتخاب عملکرد: `.ماهیگیری پیشی` (غذا به پیشی، پیش‌فرض) · `.ماهیگیری فروش` · `.ماهیگیری یخچال`")
+HELP_FRIDGE = ("🧊 **یخچال** ← `.یخچال` روشن/خاموش می‌کنه.\n"
+               "انتخاب عملکرد: `.یخچال فروش` (پیش‌فرض) · `.یخچال پیشی`")
+HELP_BAT = ("🦇 **خفاش** ← `.خفاش` روشن/خاموش می‌کنه.\n"
+            "`.خفاش تاخیر 2` (۰ تا ۱۱۵ ثانیه) · `.خفاش لیست` (جدول کد ← ایموجی)\n"
+            "✋ دستی: روی پیام خفاش ریپلای کن و بنویس `batt`")
+
+
+def _want(toks, active):
+    """True=روشن، False=خاموش، None=ورودی نامفهوم. بدون آرگومان ← برعکس حالت فعلی."""
+    toks = [t for t in toks if not t.isdigit()]
+    if not toks:
+        return not active
+    if any(t in OFF_WORDS for t in toks):
+        return False
+    if any(t in ON_WORDS for t in toks):
+        return True
+    return None
 
 
 async def c_automeow(event, arg):
     cid = event.chat_id
-    toks = num(arg).lower().split()
-    mt, mc = meow_mode(cid)
-    if not toks:
-        cur = {"instant": "لحظه‌ای ⚡", "schedule": f"زمان‌دار 📅 ({mc} پیام)"}.get(mt, "خاموش 🔴")
-        return await reply(event, f"{HELP_MEOW}\n\nوضعیت این چت: {cur}")
-    cmd = toks[0]
-    if cmd in ("instant", "on", "زنده", "فوری"):
-        await clear_sched(cid, MEOW_WORDS)
-        set_meow(cid, "instant")
+    w = _want(num(arg).lower().split(), meow_on(cid))
+    if w is None:
+        return await reply(event, HELP_MEOW)
+    if w:
+        await clear_sched(cid, MEOW_WORDS)  # باقی‌مونده‌ی نسخه‌ی قدیمی
+        set_meow(cid, True)
         await _enable("automeow")
-        return await reply(event, "🐱 میو خودکار (لحظه‌ای ⚡) روشن شد 🟢")
-    if cmd in ("schedule", "sched", "زمان‌دار", "زماندار"):
-        n = int(toks[1]) if len(toks) > 1 and toks[1].isdigit() else 1
-        n = max(1, min(90, n))
-        set_meow(cid, "schedule", n)
-        await _enable("automeow")
-        asyncio.create_task(_guarded(lambda e: meow_kick(cid), event))
-        return await reply(
-            event, f"🐱 میو خودکار (زمان‌دار 📅 — {n} پیام) روشن شد 🟢\nℹ️ یه میوی اولیه می‌فرستم تا کولداون رو بفهمم.")
-    if cmd in ("off", "خاموش"):
-        await clear_sched(cid, MEOW_WORDS)
-        set_meow(cid, "off")
-        await ensure()
-        return await reply(event, "🐱 میو خودکار این چت خاموش شد 🔴")
-    await reply(event, HELP_MEOW)
-
-
-def _parse_game_args(toks, actions):
-    action = typ = None
-    off = False
-    for t in toks:
-        if t in ("off", "خاموش"):
-            off = True
-        elif t in actions:
-            action = actions[t]
-        elif t in ("instant", "live", "on", "زنده", "فوری"):
-            typ = "instant"
-        elif t in ("schedule", "sched", "زمان‌دار", "زماندار"):
-            typ = "schedule"
-    return action, typ, off
+        return await reply(event, "🐱 میویی روشن شد 🟢\nزمان انتظار رو از جواب بات می‌خونم و دقیق همون موقع می‌فرستم.")
+    set_meow(cid, False)
+    await ensure()
+    await reply(event, "🐱 میویی این چت خاموش شد 🔴")
 
 
 async def c_autofish(event, arg):
     cid = event.chat_id
     toks = num(arg).lower().split()
+    acts = {"feed": "feed", "cat": "feed", "پیشی": "feed", "غذا": "feed", "sell": "sell", "فروش": "sell",
+            "fridge": "fridge", "یخچال": "fridge"}
+    action = next((acts[t] for t in toks if t in acts), None)
     info = fish_info(cid)
-    if not toks:
-        cur = (f"{'لحظه‌ای ⚡' if info['type'] == 'instant' else 'زمان‌دار 📅'} — {FISH_LABEL[info['action']]}"
-               if info["active"] else "خاموش 🔴")
-        return await reply(event, f"{HELP_FISH}\n\nوضعیت این چت: {cur}")
-    action, typ, off = _parse_game_args(toks, {"feed": "feed", "cat": "feed", "sell": "sell", "fridge": "fridge"})
-    if off:
-        await clear_sched(cid, FISH_WORDS)
-        set_fish(cid, "feed", "off")
-        await ensure()
-        return await reply(event, "🎣 ماهیگیری خودکار این چت خاموش شد 🔴")
-    action = action or (info["action"] if info["active"] else "feed")
-    typ = typ or "instant"
-    await clear_sched(cid, FISH_WORDS)
-    set_fish(cid, action, typ)
-    await _enable("autofish")
-    if typ == "schedule":
-        asyncio.create_task(_guarded(lambda e: fish_kick(cid), event))
-    await reply(event, f"🎣 ماهیگیری خودکار ({'لحظه‌ای ⚡' if typ == 'instant' else 'زمان‌دار 📅'}) روشن شد 🟢\n"
-                       f"▸ عملکرد: {FISH_LABEL[action]}")
+    rest = [t for t in toks if t not in acts]
+    w = True if (action and not any(t in OFF_WORDS for t in rest)) else _want(rest, info["active"])
+    if w is None:
+        return await reply(event, HELP_FISH)
+    if w:
+        action = action or (info["action"] if info["active"] else "feed")
+        set_fish(cid, action, True)
+        await _enable("autofish")
+        return await reply(event, f"🎣 ماهیگیری روشن شد 🟢\n▸ عملکرد: {FISH_LABEL[action]}")
+    set_fish(cid, "feed", False)
+    await ensure()
+    await reply(event, "🎣 ماهیگیری این چت خاموش شد 🔴")
 
 
 async def c_autofridge(event, arg):
     cid = event.chat_id
     toks = num(arg).lower().split()
+    acts = {"sell": "sell", "فروش": "sell", "feed": "feed", "cat": "feed", "پیشی": "feed", "غذا": "feed"}
+    action = next((acts[t] for t in toks if t in acts), None)
     info = fridge_info(cid)
-    if not toks:
-        cur = (f"{'لحظه‌ای ⚡' if info['type'] == 'instant' else 'زمان‌دار 📅'} — {FRIDGE_LABEL[info['action']]}"
-               if info["active"] else "خاموش 🔴")
-        return await reply(event, f"{HELP_FRIDGE}\n\nوضعیت این چت: {cur}")
-    action, typ, off = _parse_game_args(toks, {"sell": "sell", "feed": "feed", "cat": "feed"})
-    if off:
-        await clear_sched(cid, FRIDGE_WORDS)
-        set_fridge(cid, "sell", "off")
-        await ensure()
-        return await reply(event, "🧊 یخچال خودکار این چت خاموش شد 🔴")
-    action = action or (info["action"] if info["active"] else "sell")
-    typ = typ or "instant"
-    await clear_sched(cid, FRIDGE_WORDS)
-    set_fridge(cid, action, typ)
-    await _enable("autofridge")
-    if typ == "schedule":
-        asyncio.create_task(_guarded(lambda e: fridge_kick(cid), event))
-    await reply(event, f"🧊 یخچال خودکار ({'لحظه‌ای ⚡' if typ == 'instant' else 'زمان‌دار 📅'}) روشن شد 🟢\n"
-                       f"▸ عملکرد: {FRIDGE_LABEL[action]}")
+    rest = [t for t in toks if t not in acts]
+    w = True if (action and not any(t in OFF_WORDS for t in rest)) else _want(rest, info["active"])
+    if w is None:
+        return await reply(event, HELP_FRIDGE)
+    if w:
+        action = action or (info["action"] if info["active"] else "sell")
+        set_fridge(cid, action, True)
+        await _enable("autofridge")
+        return await reply(event, f"🧊 یخچال روشن شد 🟢\n▸ عملکرد: {FRIDGE_LABEL[action]}")
+    set_fridge(cid, "sell", False)
+    await ensure()
+    await reply(event, "🧊 یخچال این چت خاموش شد 🔴")
+
+
+HELP_CAT = ("😺 **پیشی** ← `.پیشی` روشن/خاموش می‌کنه.\n"
+            "از پیام «پیشی» ظرفیت و سرعت تولید رو می‌خونه، زمان پر شدن رو دقیق حساب می‌کنه و "
+            "همون موقع «برداشت میو پوینت ها» رو می‌زنه.")
+
+
+async def c_autocat(event, arg):
+    cid = event.chat_id
+    w = _want(num(arg).lower().split(), cat_on(cid))
+    if w is None:
+        return await reply(event, HELP_CAT)
+    if w:
+        set_cat(cid, True)
+        await _enable("autocat")
+        return await reply(event, "😺 برداشت خودکار میو پوینت روشن شد 🟢\nوقتی ظرفیت پر شد خودم برمی‌دارم.")
+    set_cat(cid, False)
+    await ensure()
+    await reply(event, "😺 برداشت خودکار میو پوینت این چت خاموش شد 🔴")
 
 
 async def c_autobat(event, arg):
@@ -1257,31 +1121,26 @@ async def c_autobat(event, arg):
     toks = num(arg).lower().split()
     bats = M()["bat"]
     cfg = bats.get(cid, {"on": False, "delay": 1})
-    if not toks:
-        st = f"🟢 فعال (تأخیر {cfg.get('delay', 1)}s)" if cfg.get("on") else "🔴 خاموش"
-        return await reply(event, f"{HELP_BAT}\n\nوضعیت این چت: {st}")
-    cmd = toks[0]
-    if cmd in ("on", "روشن"):
-        cfg["on"] = True
-        bats[cid] = cfg
-        await _enable("autobat")
-        return await reply(event, "🦇 شکار خودکار خفاش توی این چت روشن شد 🟢")
-    if cmd in ("off", "خاموش"):
-        cfg["on"] = False
-        bats[cid] = cfg
-        save_settings()
-        return await reply(event, "🦇 شکار خودکار خفاش توی این چت خاموش شد 🔴")
-    if cmd in ("delay", "تاخیر", "تأخیر"):
+    if toks and toks[0] in ("delay", "تاخیر", "تأخیر"):
         if len(toks) > 1 and toks[1].isdigit():
             cfg["delay"] = max(0, min(115, int(toks[1])))
             bats[cid] = cfg
             save_settings()
             return await reply(event, f"⏱ تأخیر شکار خفاش: {cfg['delay']} ثانیه")
-        return await reply(event, "عدد بین ۰ تا ۱۱۵ بده. مثال: `.autobat delay 2`")
-    if cmd in ("list", "لیست"):
+        return await reply(event, "عدد بین ۰ تا ۱۱۵ بده. مثال: `.خفاش تاخیر 2`")
+    if toks and toks[0] in ("list", "لیست"):
         rows = [f"`{k}` ➔ {v}" for k, v in sorted(BAT_EMOJI.items())]
         return await reply(event, "🦇 **کد ← ایموجی خفاش‌ها**\n\n" + "\n".join(rows))
-    await reply(event, HELP_BAT)
+    w = _want(toks, bool(cfg.get("on")))
+    if w is None:
+        return await reply(event, HELP_BAT)
+    cfg["on"] = w
+    bats[cid] = cfg
+    if w:
+        await _enable("autobat")
+        return await reply(event, f"🦇 شکار خودکار خفاش روشن شد 🟢 (تأخیر {cfg.get('delay', 1)} ثانیه)")
+    save_settings()
+    await reply(event, "🦇 شکار خودکار خفاش این چت خاموش شد 🔴")
 
 
 async def c_show(event, arg):

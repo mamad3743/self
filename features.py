@@ -30,6 +30,7 @@ import core
 import botpanel
 import meow
 import updater
+import ctl
 from core import (
     F, CFG, FEATS, FEAT, state, log, TZ, save_settings, digits,
     jalali_short, jalali_long, clock_text, strip_clock, strip_bio, profile_key,
@@ -284,9 +285,10 @@ alias("meowie", "meowie", "میویی")
 alias("backup", "backup", "پشتیبان")
 alias("restore", "restore", "بازیابی")
 alias("automeow", "automeow", "میوخودکار")
-alias("autofish", "autofish", "ماهیگیر")
-alias("autofridge", "autofridge", "یخچالی")
+alias("autofish", "autofish", "ماهیگیری", "ماهیگیر")
+alias("autofridge", "autofridge", "یخچال", "یخچالی")
 alias("autobat", "autobat", "خفاش")
+alias("autocat", "autocat", "پیشی")
 alias("show", "show", "نمایش")
 alias("sched", "sched", "زمانبندی")
 alias("alias", "alias", "الیاس", "میانبر")
@@ -295,7 +297,7 @@ alias("mstatus", "meowstatus", "meowhelp", "بازی")
 alias("update", "update", "آپدیت", "بروزرسانی")
 meow.RESERVED.update(ALIASES)  # اسم الیاس‌های کاربر نباید با دستورهای سلف یکی باشه
 
-SLASH_OK = {"automeow", "autofish", "autofridge", "autobat", "autocatch"}  # این‌ها با «/» هم کار می‌کنن
+SLASH_OK = {"automeow", "autofish", "autofridge", "autobat", "autocatch", "autocat"}  # این‌ها با «/» هم کار می‌کنن
 CMD_PATTERN = (
     r"(?is)^([./])(" + "|".join(re.escape(a) for a in sorted(ALIASES, key=len, reverse=True))
     + r")(?:\s+(.*))?$"
@@ -1633,23 +1635,6 @@ async def c_auto(event, arg):
     await event.edit(AUTO_HELP)
 
 
-async def c_meowie(event, arg):
-    """آماده‌ساز بازی میویی: هر ۵ دقیقه «میو» توی این چت. .میویی هوشمند ← زمان انتظار رو از جواب بات می‌خونه."""
-    head, _, rest = arg.partition(" ")
-    if arg.lower() in ("off", "خاموش"):
-        return await c_auto(event, "پاک")
-    smart = head in ("هوشمند", "smart")
-    text = (rest.strip() if smart else arg) or "میو"
-    for t in CFG["autotasks"]:
-        if t["chat"] == event.chat_id and t["kind"] == "send" and t["text"] == text:
-            return await event.edit(f"کار «{text}» از قبل برای این چت ثبت شده (#{t['id']})")
-    tid = add_task(event.chat_id, "send", text, 300, smart)
-    await event.edit(
-        f"🐱 کار #{tid} ثبت شد: «{text}» هر ۵ دقیقه" + (" (🧠 هوشمند)" if smart else "") + ".\n"
-        "برای ماهیگیری/غذا دادن، همون متنی که توی بازی می‌فرستی رو بده:\n"
-        ".خودکار هوشمند 10m <متن دستور>\n.خودکار کلیک 10m <متن دکمه>")
-
-
 # ───── نجات خودکار (کلیک روی دکمه‌ی پیام‌های بات) ─────
 catch_seen = {}
 
@@ -1707,8 +1692,15 @@ async def c_catch(event, arg):
         allc.pop(key, None)
         save_settings()
         return await meow.reply(event, "🐈 نجات خودکار این چت خاموش شد")
+    if not head:  # بدون آرگومان: روشن/خاموش
+        if key in allc:
+            allc.pop(key)
+            save_settings()
+            return await meow.reply(event, "🐈 نجات خودکار این چت خاموش شد 🔴")
     cfg = allc.setdefault(key, {"word": "نجات", "delay": 1.0})
-    if head in ("کلمه", "word") and rest:
+    if head in ("on", "روشن"):
+        pass
+    elif head in ("کلمه", "word") and rest:
         cfg["word"] = rest
     elif head in ("تاخیر", "تأخیر", "delay"):
         try:
@@ -1792,7 +1784,7 @@ async def run_update(msg, reply_to):
 
 async def on_update_file(event):
     """حالت خودکار: با روشن بودن کلید «بروزرسانی با فایل»."""
-    if not (F["update"] and state["authorized"]) or not update_file_ok(event.message):
+    if ctl.INSTANCE or not (F["update"] and state["authorized"]) or not update_file_ok(event.message):
         return
     if not _fname(event.message).lower().endswith((".zip", ".py")):
         return
@@ -1811,6 +1803,8 @@ UPDATE_HELP = (
 
 
 async def c_update(event, arg):
+    if ctl.INSTANCE:
+        return await event.edit("🔒 توی حالت هاب بروزرسانی با فایل فقط برای ادمین هاب و از طریق بات هاب ممکنه")
     head = arg.strip().lower()
     if head in ("وضعیت", "status"):
         return await event.edit(updater.status())
@@ -1847,9 +1841,9 @@ HANDLERS = {
     "music": c_music, "currency": c_currency, "logo": c_logo, "action": c_action,
     "online": c_online, "seen": c_seen, "comment": c_comment, "mentionlog": c_mentionlog,
     "antidel": c_antidel, "backup": c_backup, "restore": c_restore, "status": c_status,
-    "auto": c_auto, "meowie": c_meowie, "catch": c_catch,
+    "auto": c_auto, "meowie": meow.c_automeow, "catch": c_catch,
     "automeow": meow.c_automeow, "autofish": meow.c_autofish, "autofridge": meow.c_autofridge,
-    "autobat": meow.c_autobat, "show": meow.c_show, "sched": meow.c_sched, "alias": meow.c_alias,
+    "autobat": meow.c_autobat, "autocat": meow.c_autocat, "show": meow.c_show, "sched": meow.c_sched, "alias": meow.c_alias,
     "proxy": meow.c_proxy, "mstatus": meow.c_mstatus, "update": lambda e, a: c_update(e, a),
 }
 assert set(ALIASES.values()) == set(HANDLERS), set(ALIASES.values()) ^ set(HANDLERS)

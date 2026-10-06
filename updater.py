@@ -75,7 +75,7 @@ async def smoke_test(stage: str):
     env.update(SELF_OVERLAY="1", PYTHONDONTWRITEBYTECODE="1")
     env.setdefault("PANEL_PASSWORD", "test")
     env["PYTHONPATH"] = boot.REPO_DIR
-    code = "import core, botpanel, meow, features, updater, main"
+    code = "import core, botpanel, meow, features, updater, ctl, hub, main"
     p = await asyncio.create_subprocess_exec(
         sys.executable, "-c", code, cwd=stage, env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
