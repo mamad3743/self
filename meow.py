@@ -4,6 +4,7 @@
 
 تنظیمات توی CFG["meow"] ذخیره می‌شن (همون settings.json روی Volume).
 """
+import os
 import re
 import math
 import html
@@ -18,6 +19,7 @@ from telethon.tl.types import User, Channel, Chat
 from telethon.tl.functions.users import GetFullUserRequest
 
 import core
+import extras
 from core import F, CFG, state, log, save_settings
 
 NUM_FA = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
@@ -56,6 +58,8 @@ def M() -> dict:
     m.setdefault("autofridge", {})  # {chat: {"action": sell|feed, "type": instant|schedule}}
     m.setdefault("bat", {})  # {chat: {"on": bool, "delay": 0..115}}
     m.setdefault("autocat", {})  # {chat: {"type": "instant"}} برداشت خودکار میو پوینت پیشی
+    m.setdefault("next", {})  # {"meow:چت": زمان نوبت بعدی} ← با ریستارت از دست نمی‌ره (ضد اسپم)
+    m.setdefault("boots", [])
     return m
 
 
@@ -82,6 +86,8 @@ async def reply(event, text, delete_after=1.0, **kw):
 
 # ───────────── ارسال امن + منتظر جواب بات ─────────────
 _locks = {}
+MIN_GAP = (3.0, 6.0)
+_last_any = 0.0
 _last_sent = {}
 _slow = {}
 _reply_w = {}  # (chat, msg_id) -> Future (جواب بات به پیام من)
@@ -110,7 +116,12 @@ async def slowmode(cid) -> int:
 
 
 async def send_safe(cid, text, **kw):
-    """ارسال با رعایت اسلو‌مود گروه."""
+    """ارسال با رعایت اسلو‌مود گروه و فاصله‌ی حداقلی (ضد اسپم): ۳ تا ۶ ثانیه بین دو پیام یه چت، ۱.۵ ثانیه بین چت‌ها."""
+    global _last_any
+    t = time.time()
+    wait = max(random.uniform(*MIN_GAP) - (t - _last_sent.get(cid, 0)), 1.5 - (t - _last_any))
+    if wait > 0:
+        await asyncio.sleep(wait)
     sm = await slowmode(cid)
     if sm > 0:
         diff = time.time() - _last_sent.get(cid, 0)
@@ -119,7 +130,7 @@ async def send_safe(cid, text, **kw):
     for _ in range(3):
         try:
             res = await C().send_message(cid, text, **kw)
-            _last_sent[cid] = time.time()
+            _last_sent[cid] = _last_any = time.time()
             return res
         except SlowModeWaitError as e:
             await asyncio.sleep(e.seconds + random.randint(2, 5))
@@ -242,6 +253,121 @@ async def sched_send(cid, text, ts):
     await C().send_message(cid, text, schedule=dt)
 
 
+# ───────────── هشدار، خطا و ساعت خاموشی حلقه‌ها ─────────────
+KIND_NAME = {"meow": "میویی", "fish": "ماهیگیری", "fridge": "یخچال", "cat": "پیشی"}
+_miss_n = {}
+_err_n = {}
+
+
+def note_reply(kind, cid, got: bool):
+    """۳ بار پشت‌سرهم جواب نیومد ← هشدار."""
+    k = (kind, cid)
+    if got:
+        _miss_n[k] = 0
+        return
+    _miss_n[k] = _miss_n.get(k, 0) + 1
+    if _miss_n[k] >= 3:
+        asyncio.create_task(extras.alert(
+            f"noreply:{kind}:{cid}", f"⚠️ بات توی چت <code>{cid}</code> به «{KIND_NAME[kind]}» جواب نمی‌ده "
+                                     f"({_miss_n[k]} بار پشت‌سرهم). بات خاموشه یا ازش بلاک/میوت شدی؟"))
+
+
+def note_unclear(kind, cid, txt):
+    k = ("unclear", kind, cid)
+    _miss_n[k] = _miss_n.get(k, 0) + 1
+    if _miss_n[k] >= 3:
+        asyncio.create_task(extras.alert(
+            f"unclear:{kind}:{cid}", f"⚠️ متن جواب بات برای «{KIND_NAME[kind]}» قابل فهم نیست؛ شاید بات متنش رو عوض کرده. "
+                                     f"نمونه:\n<code>{html.escape((txt or '')[:150])}</code>"))
+
+
+def loop_ok(kind, cid):
+    _err_n[(kind, cid)] = 0
+
+
+async def loop_error(kind, cid, e):
+    extras.bump("errors")
+    k = (kind, cid)
+    _err_n[k] = _err_n.get(k, 0) + 1
+    if isinstance(e, FloodWaitError):
+        if e.seconds >= 60:
+            await extras.alert(f"flood:{kind}:{cid}", f"⏳ تلگرام «{KIND_NAME[kind]}» توی چت <code>{cid}</code> رو برای {e.seconds} ثانیه محدود کرد (FloodWait).")
+    elif _err_n[k] >= 5:
+        await extras.alert(f"err:{kind}:{cid}", f"⚠️ «{KIND_NAME[kind]}» توی چت <code>{cid}</code> پشت‌سرهم خطا می‌ده: {type(e).__name__}")
+
+
+async def quiet_gate() -> bool:
+    """توی ساعت خاموشی می‌خوابه تا پایان بازه؛ True یعنی خوابیدیم و حلقه باید دوباره از اول چک کنه."""
+    q = extras.quiet_remaining()
+    if not q:
+        return False
+    await asyncio.sleep(q + random.randint(5, 90))
+    return True
+
+
+# ───────────── ضد اسپم: ریستارت، شروع پلکانی، جریمه ─────────────
+START_DELAY = int(os.getenv("GAME_START_DELAY", "45"))  # مهلت بعد از بالا اومدن سلف قبل از اولین پیام بازی
+_boot_t = None
+_delay_eff = None
+_stagger_n = 0
+PENALTY_RE = re.compile(r"اسپم|spam", re.I)
+
+
+def next_get(kind, cid) -> float:
+    return float(M().get("next", {}).get(f"{kind}:{cid}", 0) or 0)
+
+
+def next_set(kind, cid, sleep):
+    """زمان نوبت بعدی رو روی دیسک نگه می‌داره تا ریستارت/آپدیت وسط کولداون پیام اضافه نفرسته."""
+    n = M().setdefault("next", {})
+    key = f"{kind}:{cid}"
+    if sleep >= 20:
+        n[key] = time.time() + sleep
+        save_settings()
+    else:
+        n.pop(key, None)
+
+
+def register_boot():
+    """اولین بار که وارد شدیم صدا زده می‌شه؛ ریستارت‌های پشت‌سرهم ← مهلت شروع طولانی‌تر."""
+    global _boot_t, _delay_eff
+    if _boot_t is not None:
+        return
+    _boot_t = time.time()
+    boots = [t for t in M().get("boots", []) if _boot_t - t < 900] + [_boot_t]
+    M()["boots"] = boots[-6:]
+    _delay_eff = max(START_DELAY, 180) if len(boots) >= 3 and START_DELAY else START_DELAY
+    save_settings()
+    if _delay_eff > START_DELAY:
+        asyncio.create_task(extras.alert(
+            "boots", "⚠️ سلف ۳ بار توی ۱۵ دقیقه ریستارت شد؛ برای جلوگیری از اسپم بات، شروع بازی‌ها ۳ دقیقه عقب افتاد."))
+
+
+async def startup_wait(kind, cid):
+    """اول هر حلقه: صبر تا نوبت ذخیره‌شده + مهلت شروع؛ حلقه‌های بوت هرکدوم با فاصله‌ی جدا شروع می‌کنن."""
+    global _stagger_n
+    now = time.time()
+    t0 = _boot_t or now
+    delay = _delay_eff if _delay_eff is not None else START_DELAY
+    wait = max(next_get(kind, cid), t0 + delay) - now
+    if _boot_t and now < _boot_t + delay + 120:
+        wait += _stagger_n * random.uniform(6, 12)
+        _stagger_n += 1
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+
+def penalty_hit(txt) -> bool:
+    return bool(txt and PENALTY_RE.search(txt))
+
+
+async def on_penalty(kind, cid, txt) -> int:
+    asyncio.create_task(extras.alert(
+        f"penalty:{kind}:{cid}", f"🚨 بات توی چت <code>{cid}</code> به «{KIND_NAME[kind]}» هشدار اسپم داد؛ ۱۰ دقیقه کنار کشیدم.\n"
+                                 f"<code>{html.escape((txt or '')[:150])}</code>", cooldown=600))
+    return 600
+
+
 # ───────────── میو خودکار ─────────────
 _main_cd = {}  # (chat) -> آخرین کولداون اصلی میو
 
@@ -268,13 +394,18 @@ def parse_meow_cd(txt):
 async def meow_once(cid) -> int:
     """یه میو می‌فرسته؛ ثانیه‌ی دقیق نوبت بعدی رو از جواب بات برمی‌گردونه."""
     sent = await send_safe(cid, random.choice(MEOW_WORDS))
+    extras.bump("meow")
     rep = await wait_reply(cid, sent.id, 28)
+    note_reply("meow", cid, bool(rep))
     if not rep:
         return 60
     txt = rep.raw_text or ""
+    if penalty_hit(txt):
+        return await on_penalty("meow", cid, txt)
     cd = parse_meow_cd(txt)
     if cd is None:
         log.info("automeow: زمان انتظار توی جواب بات پیدا نشد: %r", txt[:200])
+        note_unclear("meow", cid, txt)
         return 255
     if "هنوز میوت نمیاد" not in txt:
         _main_cd[cid] = cd
@@ -282,17 +413,24 @@ async def meow_once(cid) -> int:
 
 
 async def meow_loop(cid):
+    await startup_wait("meow", cid)
     while True:
         if not (F["automeow"] and meow_on(cid)):
             return
+        if await quiet_gate():
+            continue
         try:
             async with chat_lock(cid):
                 cd = await meow_once(cid)
+            loop_ok("meow", cid)
         except FloodWaitError as e:
             cd = e.seconds + 5
+            await loop_error("meow", cid, e)
         except Exception as e:  # noqa
             log.warning("automeow %s: %r", cid, e)
             cd = 60
+            await loop_error("meow", cid, e)
+        next_set("meow", cid, cd + 1)
         await asyncio.sleep(cd + 1)  # دقیقاً همون زمانی که بات گفت (+۱ ثانیه برای اینکه زودتر نرسیم)
 
 
@@ -338,6 +476,8 @@ def _has_fish_btn(msg, action) -> bool:
 async def fish_act(cid, init, action) -> int:
     """بعد از جواب بات به «ماهی»: یا زمان انتظار رو می‌خونه یا دکمه‌ی مناسب رو می‌زنه؛ ثانیه‌ی نوبت بعدی رو برمی‌گردونه.
     بعد از زدن دکمه، چند ثانیه بعد دوباره «ماهی» می‌فرستیم تا بات زمان انتظار تصادفی بعدی رو بگه و دقیق همون‌قدر صبر کنیم."""
+    if penalty_hit(init.raw_text):
+        return await on_penalty("fish", cid, init.raw_text)
     cd = parse_fish_cd(init.raw_text or "", _has_fish_btn(init, action))
     if cd:
         _fish_streak[cid] = 0
@@ -356,6 +496,7 @@ async def fish_act(cid, init, action) -> int:
             _fish_streak[cid] = 0
             return cd + 1
         log.info("autofish: جواب بات قابل فهم نبود (نه دکمه نه زمان): %r", (target.raw_text or "")[:200])
+        note_unclear("fish", cid, target.raw_text)
         return 120
     await asyncio.sleep(random.uniform(0.8, 1.6))
     btn = find_btn(target, FISH_KW.get(action, "پیشی"))
@@ -369,24 +510,33 @@ async def fish_act(cid, init, action) -> int:
     else:
         await btn.click()
     _fish_streak[cid] = _fish_streak.get(cid, 0) + 1
+    extras.bump("fish")
     return 8 if _fish_streak[cid] < 3 else 120  # اگه بات هیچ‌وقت کولداون نگفت، اسپم نکنیم
 
 
 async def fish_loop(cid):
+    await startup_wait("fish", cid)
     while True:
         info = fish_info(cid)
         if not (F["autofish"] and info["active"]):
             return
+        if await quiet_gate():
+            continue
         try:
             async with chat_lock(cid):
                 sent = await send_safe(cid, random.choice(FISH_WORDS))
                 init = await wait_reply(cid, sent.id, 20)
+                note_reply("fish", cid, bool(init))
                 sleep = await fish_act(cid, init, info["action"]) if init else 60
+            loop_ok("fish", cid)
         except FloodWaitError as e:
             sleep = e.seconds + 5
+            await loop_error("fish", cid, e)
         except Exception as e:  # noqa
             log.warning("autofish %s: %r", cid, e)
             sleep = 60
+            await loop_error("fish", cid, e)
+        next_set("fish", cid, sleep)
         await asyncio.sleep(sleep)
 
 
@@ -439,6 +589,7 @@ async def fridge_process(cid, fridge_msg, action) -> int:
             if act_msg and act_msg.buttons:
                 await asyncio.sleep(1.8)
                 await act_msg.buttons[0][0].click()
+                extras.bump("fridge")
                 await asyncio.sleep(1.8)
             continue  # ماهی بعدی
         if cook_btn:
@@ -451,6 +602,7 @@ async def fridge_process(cid, fridge_msg, action) -> int:
                 cook_sec = int(m.group(1)) * 60 + int(m.group(2)) if m else 180
                 await asyncio.sleep(2.0)
                 await confirm.buttons[0][0].click()
+                extras.bump("fridge")
                 return cook_sec + 3
             return 120
         return 1800
@@ -458,20 +610,28 @@ async def fridge_process(cid, fridge_msg, action) -> int:
 
 
 async def fridge_loop(cid):
+    await startup_wait("fridge", cid)
     while True:
         info = fridge_info(cid)
         if not (F["autofridge"] and info["active"]):
             return
+        if await quiet_gate():
+            continue
         try:
             async with chat_lock(cid):
                 sent = await send_safe(cid, "یخچال میویی")
                 msg = await wait_reply(cid, sent.id, 20)
+                note_reply("fridge", cid, bool(msg))
                 sleep = await fridge_process(cid, msg, info["action"]) if msg else 60
+            loop_ok("fridge", cid)
         except FloodWaitError as e:
             sleep = e.seconds + 5
+            await loop_error("fridge", cid, e)
         except Exception as e:  # noqa
             log.warning("autofridge %s: %r", cid, e)
             sleep = 60
+            await loop_error("fridge", cid, e)
+        next_set("fridge", cid, max(sleep, 10))
         await asyncio.sleep(max(sleep, 10))
 
 
@@ -517,14 +677,19 @@ def parse_cat(txt):
 async def cat_act(cid, init) -> int:
     """زمان پر شدن ظرفیت رو دقیق حساب می‌کنه؛ پر بود ← «برداشت میو پوینت ها» رو می‌زنه.
     ثانیه‌ی نوبت بعدی رو برمی‌گردونه (بعد از برداشت چند ثانیه بعد دوباره می‌خونه تا زمان دقیق بعدی رو بفهمه)."""
+    if penalty_hit(init.raw_text):
+        return await on_penalty("cat", cid, init.raw_text)
     target = init
     if not parse_cat(init.raw_text):
         target = await wait_buttons(cid, init.id, 20, need=lambda m: parse_cat(m.raw_text or "") is not None)
     data = parse_cat(target.raw_text if target else "")
     if not data:
         log.info("autocat: اعداد توی جواب بات پیدا نشد: %r", ((target.raw_text if target else "") or "")[:300])
+        note_unclear("cat", cid, target.raw_text if target else "")
         return 900
     prod, cap, rate = data
+    if F.get("autoupgrade") and await try_upgrade(cid, target):
+        return 8  # بعد از ارتقا پیام عوض می‌شه؛ دوباره می‌خونیم
     if prod >= cap:
         btn = find_btn(target, "برداشت")
         if not btn:
@@ -532,7 +697,12 @@ async def cat_act(cid, init) -> int:
             return 120
         await asyncio.sleep(random.uniform(0.8, 1.6))
         await btn.click()
+        extras.bump("cat")
+        extras.bump("cat_pts", int(prod))
         _cat_streak[cid] = _cat_streak.get(cid, 0) + 1
+        if _cat_streak[cid] >= 3:
+            asyncio.create_task(extras.alert(
+                f"catfail:{cid}", f"⚠️ ظرفیت پیشی توی چت <code>{cid}</code> پره ولی برداشت جواب نمی‌ده ({_cat_streak[cid]} بار)."))
         return 6 if _cat_streak[cid] < 3 else 300  # اگه برداشت جواب نداد، اسپم نکنیم
     _cat_streak[cid] = 0
     if rate <= 0:
@@ -541,20 +711,76 @@ async def cat_act(cid, init) -> int:
 
 
 async def cat_loop(cid):
+    await startup_wait("cat", cid)
     while True:
         if not (F["autocat"] and cat_on(cid)):
             return
+        if await quiet_gate():
+            continue
         try:
             async with chat_lock(cid):
                 sent = await send_safe(cid, CAT_WORD)
                 init = await wait_reply(cid, sent.id, 20)
+                note_reply("cat", cid, bool(init))
                 sleep = await cat_act(cid, init) if init else 60
+            loop_ok("cat", cid)
         except FloodWaitError as e:
             sleep = e.seconds + 5
+            await loop_error("cat", cid, e)
         except Exception as e:  # noqa
             log.warning("autocat %s: %r", cid, e)
             sleep = 60
+            await loop_error("cat", cid, e)
+        next_set("cat", cid, sleep)
         await asyncio.sleep(sleep)
+
+
+# ───────────── ارتقای خودکار مقام ─────────────
+_balance = {}  # cid -> موجودی میو پوینت (آخرین مقداری که از پیام‌های بات دیدیم)
+_upg_last = {}
+_BAL_RE = r"میو\s*پوینت\s*(?:هات|هاتون|شما|ت)[^\d\n]{0,8}([\d,٬،.]+)"
+_COST_RE = r"هزینه\s*ارتقا\s*مقام[^\d\n]{0,8}([\d,٬،.]+)"
+
+
+def _find_num(pat, txt):
+    m = re.search(pat, num(txt or ""))
+    return _to_float(m.group(1)) if m else None
+
+
+def parse_balance(txt):
+    return _find_num(_BAL_RE, txt)
+
+
+def parse_upgrade_cost(txt):
+    return _find_num(_COST_RE, txt)
+
+
+async def try_upgrade(cid, target) -> bool:
+    """موجودی ≥ هزینه‌ی ارتقا بود، دکمه‌ی «ارتقا مقام» (و تأیید احتمالی) رو می‌زنه."""
+    cost = parse_upgrade_cost(target.raw_text)
+    if cost is None:
+        return False
+    bal = _balance.get(cid)
+    if bal is None:
+        log.info("autoupgrade: موجودی میو پوینت هنوز دیده نشده (یه پیام بات با «میو پوینت هات» لازمه، مثلاً جواب میو)")
+        return False
+    if bal < cost or time.time() - _upg_last.get(cid, 0) < 600:
+        return False
+    btn = find_btn(target, "ارتقا مقام")
+    if not btn:
+        return False
+    _upg_last[cid] = time.time()
+    await asyncio.sleep(random.uniform(0.8, 1.6))
+    res = await click_wait(btn, cid, target.id, 8, need_buttons=False, fallback=True)
+    if res and res.buttons:  # اگه تأییدیه خواست
+        conf = next((b for kw in ("تایید", "تأیید", "بله", "آره") if (b := find_btn(res, kw))), None)
+        if conf:
+            await asyncio.sleep(1.2)
+            await conf.click()
+    _balance[cid] = bal - cost
+    extras.bump("upgrade")
+    await extras.alert(f"upg:{cid}", "⬆️ مقام پیشی ارتقا یافت 🎉", cooldown=0)
+    return True
 
 
 # ───────────── شکار خفاش ─────────────
@@ -583,7 +809,7 @@ def is_bat_message(txt) -> bool:
 
 async def on_bat(event):
     """خفاش‌های بازی رو خودکار با ایموجی درست ریپلای می‌کنه."""
-    if not (F["autobat"] and state.get("authorized")) or event.out:
+    if not (F["autobat"] and state.get("authorized")) or event.out or extras.is_quiet():
         return
     cfg = M()["bat"].get(str(event.chat_id))
     if not cfg or not cfg.get("on"):
@@ -607,6 +833,7 @@ async def on_bat(event):
         await asyncio.sleep(d)
     try:
         await C().send_message(event.chat_id, emoji, reply_to=event.id)
+        extras.bump("bat")
     except Exception as e:  # noqa
         log.warning("autobat send failed: %r", e)
 
@@ -685,12 +912,23 @@ async def ensure():
         TASKS[key] = asyncio.create_task(LOOPS[key[0]](key[1]))
 
 
+def prune_next():
+    n = M().get("next", {})
+    old = [k for k, v in n.items() if v < time.time() - 86400]
+    for k in old:
+        n.pop(k, None)
+
+
 async def supervisor():
     while True:
         try:
             if state.get("authorized") and core.client is not None:
+                register_boot()
                 await _migrate()
+                await extras.maybe_report()
+                prune_next()
             await ensure()
+            extras.flush()
         except Exception as e:  # noqa
             log.exception("meow supervisor: %s", e)
         await asyncio.sleep(30)
@@ -701,6 +939,10 @@ async def on_incoming(event):
     """جواب‌های بات به پیام‌های من ← آزاد کردن منتظرها."""
     if not state.get("authorized"):
         return
+    if F.get("autoupgrade") and cat_on(event.chat_id):
+        b = parse_balance(event.raw_text)
+        if b is not None:
+            _balance[event.chat_id] = b
     rid = event.reply_to_msg_id
     if not rid:
         return
@@ -710,6 +952,10 @@ async def on_incoming(event):
 
 
 async def on_edit(event):
+    if F.get("autoupgrade") and cat_on(event.chat_id):
+        b = parse_balance(event.raw_text)
+        if b is not None:
+            _balance[event.chat_id] = b
     entry = _edit_w.get((event.chat_id, event.message.id))
     if not entry:
         return
@@ -1274,5 +1520,80 @@ async def c_proxy(event, arg):
     await event.edit(help_)
 
 
+async def preset(event, on: bool):
+    """همه‌ی بازی‌های میویی رو توی همین چت یکجا روشن/خاموش می‌کنه (عملکردهای قبلی ماهیگیری/یخچال حفظ می‌شن)."""
+    cid = event.chat_id
+    sc = str(cid)
+    set_meow(cid, on)
+    set_fish(cid, fish_info(cid)["action"], on)
+    set_fridge(cid, fridge_info(cid)["action"], on)
+    set_cat(cid, on)
+    bats = M()["bat"]
+    cfg = bats.get(sc, {"on": False, "delay": 1})
+    cfg["on"] = on
+    bats[sc] = cfg
+    catch = CFG.setdefault("catch", {})
+    if on:
+        catch.setdefault(sc, {"word": "نجات", "delay": 1.0})
+        for feat in ("automeow", "autofish", "autofridge", "autocat", "autobat", "autocatch"):
+            F[feat] = True
+    else:
+        catch.pop(sc, None)
+    save_settings()
+    await ensure()
+
+
 async def c_mstatus(event, arg):
-    await event.edit(status_text(event.chat_id))
+    a = (arg or "").strip().lower()
+    if a in ("on", "روشن", "کامل", "all"):
+        await preset(event, True)
+        return await event.edit("🐾 همه‌ی بازی‌های میویی توی این چت روشن شد 🟢\n"
+                                "(میویی · ماهیگیری · یخچال · پیشی · خفاش · نجات)\n\n" + status_text(event.chat_id))
+    if a in ("off", "خاموش", "هیچ"):
+        await preset(event, False)
+        return await event.edit("🐾 همه‌ی بازی‌های میویی توی این چت خاموش شد 🔴")
+    await event.edit(status_text(event.chat_id) + "\n\n▸ `.بازی روشن` همه رو روشن می‌کنه · `.بازی خاموش` همه رو خاموش")
+
+
+# ───────────── گزارش و ساعت خاموشی ─────────────
+async def c_report(event, arg):
+    a = (arg or "").strip().lower()
+    if a in ("on", "روشن"):
+        F["report"] = True
+        save_settings()
+        return await event.edit("📊 گزارش روزانه روشن شد 🟢\nهر روز بعد از نیمه‌شب خلاصه‌ی دیروز می‌آد.")
+    if a in ("off", "خاموش"):
+        F["report"] = False
+        save_settings()
+        return await event.edit("📊 گزارش روزانه خاموش شد 🔴 (`.گزارش` هنوز آمار رو نشون می‌ده)")
+    await event.edit(extras.full_report(), parse_mode="html")
+
+
+def parse_hours(txt):
+    nums = re.findall(r"\d{1,2}", num(txt))
+    if len(nums) < 2:
+        return None
+    a, b = int(nums[0]), int(nums[1])
+    return (a, b) if 0 <= a <= 23 and 0 <= b <= 24 and a != b % 24 else None
+
+
+async def c_quiet(event, arg):
+    a = (arg or "").strip().lower()
+    q = extras.quiet_cfg()
+    if not a:
+        F["quiet"] = not F.get("quiet")
+    elif a in ("off", "خاموش"):
+        F["quiet"] = False
+    elif a in ("on", "روشن"):
+        F["quiet"] = True
+    else:
+        h = parse_hours(a)
+        if not h:
+            return await reply(event, "مثال: `.خاموشی 2-8` (ساعت شروع و پایان، ۰ تا ۲۳)")
+        q["from"], q["to"] = h[0], h[1] % 24
+        F["quiet"] = True
+    save_settings()
+    if F["quiet"]:
+        return await reply(event, f"🌙 ساعت خاموشی روشن شد 🟢\nاز {q['from']:02d}:00 تا {q['to']:02d}:00 "
+                                  f"(به وقت {getattr(core.TZ, 'key', 'سلف')}) همه‌ی خودکارها می‌خوابن.")
+    await reply(event, "🌙 ساعت خاموشی خاموش شد 🔴")

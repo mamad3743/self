@@ -195,6 +195,23 @@ _RAW = [
      "روشن بودن این کلید یعنی هر فایل مجازی که خودت توی Saved آپلود کنی بدون پرسیدن اعمال بشه؛ "
      "خاموش باشه فقط با ریپلای + «.آپدیت» اعمال می‌شه. فایل فوروارد‌شده قبول نمی‌شه.",
      [".آپدیت (روی فایل ریپلای)", ".آپدیت وضعیت", ".آپدیت برگشت", ".آپدیت پاک"]),
+    ("alerts", "🚨", "هشدار هوشمند", True,
+     "وقتی یه مشکل پیش بیاد خودش بهت خبر می‌ده: بات میویی جواب نمی‌ده، متن بات قابل فهم نیست، "
+     "FloodWait گرفتی، یا برداشت پیشی کار نمی‌کنه. هر هشدار حداکثر هر نیم ساعت یه بار می‌آد. "
+     "(حالت هاب: توی بات هاب؛ سلف تنها: Saved Messages)",
+     [".پنل ← 🚨 هشدار هوشمند"]),
+    ("report", "📊", "گزارش روزانه", True,
+     "آمار بازی (میو، ماهیگیری، یخچال، برداشت پیشی و میو پوینت، خفاش، نجات، ارتقا) رو می‌شمره. "
+     ".گزارش امروز و دیروز رو نشون می‌ده؛ روشن بودن کلید یعنی هر روز بعد از نیمه‌شب خلاصه‌ی دیروز می‌آد.",
+     [".گزارش", ".گزارش روشن", ".گزارش خاموش"]),
+    ("quiet", "🌙", "ساعت خاموشی", True,
+     "توی بازه‌ی خاموشی همه‌ی خودکارهای بازی (میو، ماهیگیری، یخچال، پیشی، خفاش، نجات) می‌خوابن و صبح خودشون "
+     "ادامه می‌دن؛ برای اینکه اکانت شب‌ها فعالیت ربات‌وار نداشته باشه. ساعت بر اساس TIMEZONE سلف.",
+     [".خاموشی 2-8", ".خاموشی", ".خاموشی off"]),
+    ("autoupgrade", "⬆️", "ارتقای خودکار مقام", True,
+     "وقتی موجودی میو پوینت از «هزینه ارتقا مقام» پیشی بیشتر شد، دکمه‌ی «ارتقا مقام» رو می‌زنه. "
+     "موجودی رو از پیام‌های بات (مثلاً جواب میو: «میو پوینت هات») می‌خونه و روی چت‌هایی کار می‌کنه که .پیشی توشون روشنه.",
+     [".پنل ← ⬆️ ارتقای خودکار مقام"]),
     ("status", "🩺", "وضعیت سلف", False,
      "مدت روشن بودن، حافظه، اتصال تلگرام، بات پنل، ذخیره‌سازی و تعداد قابلیت‌های روشن. "
      "هر بار که سلف ریستارت بشه، توی Saved Messages بهت خبر می‌ده (قابل خاموش شدن). "
@@ -230,12 +247,14 @@ GRID = [
     ["automeow", "autofish", "autofridge"],
     ["autobat", "autocat", "show"],
     ["sched"],
+    ["alerts", "report", "quiet"],
+    ["autoupgrade"],
     ["alias", "proxy", "update"],
     ["about"],
 ]
 assert sorted(k for r in GRID for k in r) == sorted(FEAT), "GRID و FEATS یکی نیستن"
 
-F = {f["key"]: (f["key"] == "clock") for f in FEATS if f["toggle"]}
+F = {f["key"]: (f["key"] in ("clock", "alerts")) for f in FEATS if f["toggle"]}  # هشدارها پیش‌فرض روشنن
 CFG = {
     "target": os.getenv("CLOCK_TARGET", "last_name"),  # last_name | bio
     "font": os.getenv("CLOCK_FONT", "2"),
@@ -260,6 +279,9 @@ CFG = {
     "autotasks": [],  # [{id, chat, kind: send|click, text, every(ثانیه), on}]
     "notify_restart": True,  # بعد از هر ریستارت توی Saved خبر بده
     "restarts": 0,
+    "stats": {},  # آمار روزانه‌ی بازی (extras.py)
+    "quiet": {"from": 2, "to": 8},  # ساعت خاموشی خودکارها
+    "report_last": "",
     "meow": {},  # تنظیمات بازی میویی: automeow/autofish/autofridge/bat/show/aliases (meow.py)
     "proxy": os.getenv("PROXY", ""),  # socks5://... | http://... | tg://proxy?... (بعد از ریستارت)
 }
@@ -298,15 +320,28 @@ def _write_json(path, data):
         log.warning("نمی‌تونم %s رو ذخیره کنم (Volume نذاشتی؟): %s", path, e)
 
 
+# کلید عمومی و مستندِ Telegram Desktop؛ برای اینکه کاربر مجبور نباشه API ID/Hash وارد کنه.
+# اولویت: متغیر محیطی ← فایل ذخیره‌شده ← این پیش‌فرض. کلید اختصاصی خودت (my.telegram.org) امن‌تره.
+DEFAULT_API = {"id": 2040, "hash": "b18441a1ff607e10a989891a5462e627"}
+API_IS_DEFAULT = False
+
+
 def load_api():
+    global API_IS_DEFAULT
     if API["id"] and API["hash"]:
         return
     try:
         with open(API_FILE) as f:
             d = json.load(f)
         API.update(id=int(d["id"]), hash=d["hash"])
+        return
     except (OSError, ValueError, KeyError):
         pass
+    if not os.getenv("NO_DEFAULT_API"):  # NO_DEFAULT_API=1 ← دوباره ورود دستی API لازم می‌شه
+        API.update(DEFAULT_API)
+        if not API_IS_DEFAULT:
+            log.warning("API_ID/API_HASH ست نشده؛ کلید پیش‌فرض داخلی استفاده می‌شه (برای امنیت بیشتر کلید خودت رو بذار)")
+        API_IS_DEFAULT = True
 
 
 def save_api():

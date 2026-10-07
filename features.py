@@ -31,6 +31,7 @@ import botpanel
 import meow
 import updater
 import ctl
+import extras
 from core import (
     F, CFG, FEATS, FEAT, state, log, TZ, save_settings, digits,
     jalali_short, jalali_long, clock_text, strip_clock, strip_bio, profile_key,
@@ -294,6 +295,8 @@ alias("sched", "sched", "زمانبندی")
 alias("alias", "alias", "الیاس", "میانبر")
 alias("proxy", "proxy", "پروکسی")
 alias("mstatus", "meowstatus", "meowhelp", "بازی")
+alias("report", "report", "گزارش")
+alias("quiet", "quiet", "خاموشی")
 alias("update", "update", "آپدیت", "بروزرسانی")
 meow.RESERVED.update(ALIASES)  # اسم الیاس‌های کاربر نباید با دستورهای سلف یکی باشه
 
@@ -1649,7 +1652,7 @@ def find_button(message, word: str):
 
 
 async def on_catch(event):
-    if not (F["autocatch"] and state["authorized"]):
+    if not (F["autocatch"] and state["authorized"]) or extras.is_quiet():
         return
     cfg = CFG["catch"].get(str(event.chat_id))
     m = event.message
@@ -1671,6 +1674,7 @@ async def on_catch(event):
         await asyncio.sleep(delay)
     try:
         await btn.click()
+        extras.bump("catch")
         if "times" in cfg and times > 1 and n + 1 < times:  # کلیک پشت‌سرهم‌ی سریع (فقط اگه خودت «تعداد» رو تنظیم کردی)
             async def _burst():
                 await asyncio.sleep(0.08)
@@ -1844,7 +1848,7 @@ HANDLERS = {
     "auto": c_auto, "meowie": meow.c_automeow, "catch": c_catch,
     "automeow": meow.c_automeow, "autofish": meow.c_autofish, "autofridge": meow.c_autofridge,
     "autobat": meow.c_autobat, "autocat": meow.c_autocat, "show": meow.c_show, "sched": meow.c_sched, "alias": meow.c_alias,
-    "proxy": meow.c_proxy, "mstatus": meow.c_mstatus, "update": lambda e, a: c_update(e, a),
+    "proxy": meow.c_proxy, "mstatus": meow.c_mstatus, "report": meow.c_report, "quiet": meow.c_quiet, "update": lambda e, a: c_update(e, a),
 }
 assert set(ALIASES.values()) == set(HANDLERS), set(ALIASES.values()) ^ set(HANDLERS)
 

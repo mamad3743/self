@@ -282,6 +282,8 @@ async def on_startup(app):
 
 
 async def on_cleanup(app):
+    for t in list(meow.TASKS.values()):  # اول حلقه‌های بازی بسته بشن؛ موقع دیپلوی/ریستارت پیام آخر نفرستن
+        t.cancel()
     for t in app["tasks"]:
         t.cancel()
     if core.client:

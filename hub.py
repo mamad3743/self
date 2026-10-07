@@ -2,18 +2,21 @@
 
 فعال‌سازی (متغیرهای Railway):
   HUB_BOT_TOKEN = توکن بات (BotFather)      HUB_ADMIN_ID = آیدی عددی تو
-  API_ID / API_HASH = از my.telegram.org     MAX_USERS = سقف کاربر (پیش‌فرض ۵)
+  API_ID / API_HASH = اختیاری (از my.telegram.org)  MAX_USERS = سقف کاربر (پیش‌فرض ۵)
   HUB_DIR = پوشه‌ی داده (پیش‌فرض /data/hub)   PROXY = اختیاری
+  MAX_RSS_MB = سقف رم هر سلف (۰ = بدون سقف)   BACKUP_HOURS = فاصله‌ی بکاپ خودکار (پیش‌فرض ۲۴)
 
 هر کاربر: /data/hub/<id>/ شامل session.txt، settings.json، ctl.jsonl (صف دستور)، status.json.
 دستورهای نقطه‌ای (.میویی و...) توی چت‌های خود کاربر مثل قبل کار می‌کنن؛ بات برای اتصال، پنل، وضعیت و مدیریته.
 """
+import io
 import os
 import re
 import sys
 import json
 import time
 import html
+import datetime
 import shutil
 import signal
 import socket
@@ -47,6 +50,10 @@ TOKEN = ""
 ADMIN = 0
 DATA = "/data/hub"
 MAX_USERS = 5
+MAX_RSS_MB = 0
+BACKUP_HOURS = 24
+BACKUP_KEEP = 7
+DAY = 86400
 API_ID = 0
 API_HASH = ""
 INSTANCES = {}
@@ -66,12 +73,14 @@ SNIPPET = (
 
 
 def configure(env=None):
-    global TOKEN, ADMIN, DATA, MAX_USERS, API_ID, API_HASH
+    global TOKEN, ADMIN, DATA, MAX_USERS, API_ID, API_HASH, MAX_RSS_MB, BACKUP_HOURS
     env = env if env is not None else os.environ
     TOKEN = env.get("HUB_BOT_TOKEN", "")
     ADMIN = int(env.get("HUB_ADMIN_ID") or 0)
     DATA = env.get("HUB_DIR", "/data/hub")
     MAX_USERS = int(env.get("MAX_USERS") or 5)
+    MAX_RSS_MB = int(env.get("MAX_RSS_MB") or 0)
+    BACKUP_HOURS = int(env.get("BACKUP_HOURS") or 24)
     core.load_api()
     API_ID = int(env.get("API_ID") or 0) or core.API["id"]
     API_HASH = env.get("API_HASH") or core.API["hash"]
@@ -117,8 +126,55 @@ def save_reg(reg):
     write_json(os.path.join(DATA, "users.json"), reg)
 
 
+def get_entry(uid):
+    return load_reg()["allowed"].get(str(uid))
+
+
 def is_allowed(uid) -> bool:
-    return uid == ADMIN or str(uid) in load_reg()["allowed"]
+    if uid == ADMIN:
+        return True
+    e = get_entry(uid)
+    if e is None:
+        return False
+    exp = e.get("expires", 0)
+    return exp == 0 or exp > time.time()
+
+
+def days_left(uid):
+    """None = نامحدود؛ وگرنه تعداد روز مونده (گرد به بالا)."""
+    e = get_entry(uid)
+    exp = (e or {}).get("expires", 0)
+    return None if not exp else max(0, -(-int(exp - time.time()) // DAY))
+
+
+def sub_text(uid) -> str:
+    if uid == ADMIN:
+        return "♾ ادمین"
+    d = days_left(uid)
+    return "♾ نامحدود" if d is None else (f"⌛ منقضی شده" if not is_allowed(uid) else f"📅 {d} روز مونده")
+
+
+def allow_user(target, name="", days=0):
+    reg = load_reg()
+    old = reg["allowed"].get(str(target), {})
+    reg["allowed"][str(target)] = {
+        "name": name or old.get("name", ""), "since": old.get("since", int(time.time())),
+        "expires": int(time.time() + days * DAY) if days > 0 else 0}
+    save_reg(reg)
+
+
+def extend_user(target, days) -> bool:
+    """مدت اشتراک رو زیاد می‌کنه (از انقضای فعلی یا از الان) و هشدارها/وضعیت منقضی رو ریست می‌کنه."""
+    reg = load_reg()
+    e = reg["allowed"].get(str(target))
+    if e is None or days <= 0:
+        return False
+    base = max(time.time(), e.get("expires", 0) or 0)
+    e["expires"] = int(base + days * DAY)
+    for k in ("expired", "warn1", "warn3"):
+        e.pop(k, None)
+    save_reg(reg)
+    return True
 
 
 def has_session(uid) -> bool:
@@ -203,7 +259,7 @@ def child_env(uid) -> dict:
         HUB_INSTANCE="1", SELF_REPO_DIR=REPO, SELF_OVERLAY="1",
         API_FILE=upath(uid, "api.json"), SESSION_FILE=upath(uid, "session.txt"),
         SETTINGS_FILE=upath(uid, "settings.json"), CTL_FILE=upath(uid, "ctl.jsonl"),
-        STATUS_FILE=upath(uid, "status.json"), PORT=str(free_port()), PANEL_PASSWORD=panel_password(uid),
+        STATUS_FILE=upath(uid, "status.json"), ALERT_FILE=upath(uid, "alerts.jsonl"), PORT=str(free_port()), PANEL_PASSWORD=panel_password(uid),
         API_ID=str(API_ID), API_HASH=API_HASH, PYTHONUNBUFFERED="1",
     )
     # اگه هاب با نسخه‌ی بروزرسانی‌شده (/data/code) بالا اومده، سلف‌ها هم همونو اجرا کنن
@@ -212,6 +268,17 @@ def child_env(uid) -> dict:
     else:
         env.pop("HUB_CODE_DIR", None)
     return env
+
+
+def rss_mb(pid):
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 class Instance:
@@ -228,6 +295,9 @@ class Instance:
     @property
     def running(self) -> bool:
         return self.proc is not None and self.proc.returncode is None
+
+    def rss(self):
+        return rss_mb(self.proc.pid) if self.running and getattr(self.proc, "pid", None) else None
 
     def start(self):
         if self.task and not self.task.done():
@@ -358,7 +428,7 @@ def migrate_admin():
 
 async def start_all():
     for uid in connected_users():
-        if os.path.exists(stopped_marker(uid)):
+        if os.path.exists(stopped_marker(uid)) or not is_allowed(uid):
             continue
         get_instance(uid).start()
         await asyncio.sleep(2)  # فشار همزمان روی CPU/حافظه نیاد
@@ -384,7 +454,7 @@ def status_text(uid) -> str:
     inst = INSTANCES.get(uid)
     st = read_status(uid)
     if not has_session(uid):
-        return "🔌 هنوز اکانتی وصل نکردی. /connect"
+        return f"🔌 هنوز اکانتی وصل نکردی. /connect\n🎫 اشتراک: {sub_text(uid)}"
     if inst and inst.failed:
         head = "⚠️ سلف چند بار کرش کرد و متوقف شد (/restart)"
     elif inst and inst.running:
@@ -399,6 +469,10 @@ def status_text(uid) -> str:
             lines.append("📡 اتصال تلگرام: " + ("✅ وارد شده" if st.get("authorized") else "❌ وارد نشده (سشن نامعتبره؟ /disconnect و دوباره /connect)"))
         else:
             lines.append("📡 اتصال تلگرام: ⏳ در حال بالا اومدن...")
+    mem = inst.rss() if inst else None
+    if mem:
+        lines.append(f"🧠 رم: {mem:.0f} MB")
+    lines.append(f"🎫 اشتراک: {sub_text(uid)}")
     flags = read_flags(uid)
     on = [FEAT[k]["emoji"] + " " + FEAT[k]["name"] for k in FEAT if flags.get(k) and k not in HIDDEN and FEAT[k]["toggle"]]
     lines.append(f"\n🎛 قابلیت‌های روشن ({len(on)}): " + ("، ".join(on) if on else "—"))
@@ -461,12 +535,15 @@ HELP = (
     "/status ← وضعیت سلفت\n"
     "/cmd ← اجرای دستور توی یه چت، مثلاً <code>/cmd me .وضعیت چت</code> یا <code>/cmd @group .میویی</code>\n"
     "/restart ، /stop ، /run ← مدیریت سلف\n"
+    "/backup ← فایل پشتیبان تنظیمات · /restore ← برگردوندن (فایل با کپشن /restore یا <code>/restore last</code>)\n"
     "/disconnect ← خروج کامل و حذف اطلاعات\n\n"
     "بعد از وصل شدن، دستورهای نقطه‌ای (<code>.میویی</code> <code>.ماهیگیری</code> و...) رو توی خود تلگرامت بزن."
 )
 ADMIN_HELP = (
-    "\n\n<b>ادمین:</b>\n/users ← لیست کاربرها\n/allow &lt;id&gt; [نام] ← دادن دسترسی\n/revoke &lt;id&gt; ← گرفتن دسترسی\n"
-    "/log [id] ← آخرین لاگ سلف\nبروزرسانی: فایل زیپ رو با کپشن <code>/update</code> بفرست"
+    "\n\n<b>ادمین:</b>\n/users ← لیست کاربرها (اشتراک و رم)\n/allow &lt;id&gt; [روز] [نام] ← دسترسی (بدون روز = نامحدود)\n"
+    "/extend &lt;id&gt; &lt;روز&gt; ← تمدید · /revoke &lt;id&gt; ← گرفتن دسترسی\n"
+    "/stop · /run · /restart &lt;id&gt; ← مدیریت سلف هر کاربر · /log [id] ← لاگ\n"
+    "/broadcast &lt;متن&gt; ← پیام به همه\nبروزرسانی: فایل زیپ رو با کپشن <code>/update</code> بفرست"
 )
 CONSENT = (
     "⚠️ <b>قبل از وصل کردن اکانت بخون</b>\n\n"
@@ -488,6 +565,19 @@ class Bot:
     async def send(self, chat, text, kb=None):
         return await self.api("sendMessage", chat_id=chat, text=text, parse_mode="HTML",
                               reply_markup=kb, disable_web_page_preview=True)
+
+    async def upload(self, method, params, field, filename, data):
+        """ارسال فایل (multipart) برای sendPhoto / sendDocument / editMessageMedia."""
+        form = aiohttp.FormData()
+        for k, v in params.items():
+            if v is not None:
+                form.add_field(k, v if isinstance(v, str) else str(v))
+        form.add_field(field, data, filename=filename)
+        async with self.s.post(botpanel.API_URL.format(token=TOKEN, method=method), data=form) as r:
+            res = await r.json(content_type=None)
+        if not res.get("ok"):
+            raise botpanel.BotError(res.get("description", "?"), res.get("error_code"))
+        return res["result"]
 
     async def edit(self, chat, mid, text, kb=None):
         try:
@@ -520,8 +610,10 @@ async def notify_failed(uid):
 
 
 _bot_ref = {}
-ACCESS_KB = lambda uid: {"inline_keyboard": [[botpanel.btn("✅ تأیید", f"ok:{uid}", "success"),
-                                               botpanel.btn("❌ رد", f"no:{uid}", "danger")]]}
+ACCESS_KB = lambda uid: {"inline_keyboard": [
+    [botpanel.btn("✅ ۳۰ روز", f"ok:{uid}:30", "success"), botpanel.btn("✅ ۷ روز", f"ok:{uid}:7", "success"),
+     botpanel.btn("♾ نامحدود", f"ok:{uid}:0", "primary")],
+    [botpanel.btn("❌ رد", f"no:{uid}", "danger")]]}
 
 
 # ───────────── ورود اکانت ─────────────
@@ -531,6 +623,11 @@ def make_client():
 
 async def cleanup_login(uid):
     st = LOGIN.pop(uid, None)
+    t = st.get("task") if st else None
+    if t and t is not asyncio.current_task():
+        t.cancel()
+    if st and st.get("mid") and st.get("step") in ("qr", "pw") and _bot_ref.get("bot") and st.get("task"):
+        await _bot_ref["bot"].delete(st["chat"], st["mid"])
     if st and st.get("client"):
         try:
             await st["client"].disconnect()
@@ -555,6 +652,9 @@ async def begin_login(bot, uid, chat):
     await bot.send(chat, CONSENT, {"inline_keyboard": [[botpanel.btn("✅ قبول دارم، ادامه", "go", "success")]]})
 
 
+METHOD_KB = {"inline_keyboard": [[botpanel.btn("🔳 با QR (بدون کد)", "qr", "primary"), botpanel.btn("📱 با شماره", "ph", "success")]]}
+
+
 async def ask_phone(bot, uid, chat):
     LOGIN[uid] = {"step": "phone", "ts": time.time(), "chat": chat, "client": None}
     await bot.send(chat, "📱 شماره‌ی اکانتت رو با کد کشور بفرست (مثلاً <code>+989121234567</code>).\nلغو: /cancel")
@@ -575,6 +675,8 @@ async def handle_login(bot, msg):
     text = (msg.get("text") or "").strip()
     await bot.delete(chat, msg["message_id"])  # شماره/کد/رمز نباید توی چت بمونه
     step = st["step"]
+    if step == "qr":
+        return await bot.send(chat, "🔳 QR رو توی یه دستگاه دیگه اسکن کن (یا /cancel).")
     try:
         if step == "phone":
             phone = parse_phone(text)
@@ -676,36 +778,56 @@ async def cmd_cmd(bot, uid, chat, arg):
     await bot.send(chat, f"✅ فرستاده شد به <code>{html.escape(target)}</code>: <code>{html.escape(text[:200])}</code>")
 
 
-async def cmd_restart(bot, uid, chat, arg):
-    if not has_session(uid):
-        return await bot.send(chat, "🔌 اول /connect")
-    inst = get_instance(uid)
-    await bot.send(chat, "🔄 دارم ریستارت می‌کنم...")
-    await inst.stop()
-    try:
-        os.remove(stopped_marker(uid))
-    except OSError:
-        pass
-    inst.start()
+def tgt(uid, arg):
+    """ادمین می‌تونه آیدی کاربر رو بده؛ بقیه فقط خودشون."""
+    return int(arg.strip()) if uid == ADMIN and arg.strip().isdigit() else uid
+
+
+def revive(target):
+    """بعد از تأیید/تمدید: اگه کاربر اکانت وصل داره و دستی متوقف نکرده، سلفش دوباره بالا بیاد."""
+    if has_session(target) and is_allowed(target) and not os.path.exists(stopped_marker(target)):
+        inst = get_instance(target)
+        if not inst.running:
+            inst.start()
 
 
 async def cmd_stop(bot, uid, chat, arg):
-    if not has_session(uid):
-        return await bot.send(chat, "🔌 اول /connect")
-    await get_instance(uid).stop()
-    open(stopped_marker(uid), "w").close()
-    await bot.send(chat, "🔴 سلف متوقف شد. دوباره: /run")
+    t = tgt(uid, arg)
+    if not has_session(t):
+        return await bot.send(chat, "🔌 اول /connect" if t == uid else "این کاربر اکانتی وصل نکرده")
+    await get_instance(t).stop()
+    open(stopped_marker(t), "w").close()
+    await bot.send(chat, f"🔴 سلف{'' if t == uid else ' ' + str(t)} متوقف شد. دوباره: /run" + ("" if t == uid else f" {t}"))
 
 
 async def cmd_run(bot, uid, chat, arg):
-    if not has_session(uid):
-        return await bot.send(chat, "🔌 اول /connect")
+    t = tgt(uid, arg)
+    if not has_session(t):
+        return await bot.send(chat, "🔌 اول /connect" if t == uid else "این کاربر اکانتی وصل نکرده")
+    if not is_allowed(t):
+        return await bot.send(chat, "⌛ اشتراک منقضی شده؛ اول تمدید (/extend)")
     try:
-        os.remove(stopped_marker(uid))
+        os.remove(stopped_marker(t))
     except OSError:
         pass
-    get_instance(uid).start()
+    get_instance(t).start()
     await bot.send(chat, "🟢 سلف داره بالا میاد...")
+
+
+async def cmd_restart(bot, uid, chat, arg):
+    t = tgt(uid, arg)
+    if not has_session(t):
+        return await bot.send(chat, "🔌 اول /connect" if t == uid else "این کاربر اکانتی وصل نکرده")
+    if not is_allowed(t):
+        return await bot.send(chat, "⌛ اشتراک منقضی شده؛ اول تمدید (/extend)")
+    inst = get_instance(t)
+    await bot.send(chat, "🔄 دارم ریستارت می‌کنم...")
+    await inst.stop()
+    try:
+        os.remove(stopped_marker(t))
+    except OSError:
+        pass
+    inst.start()
 
 
 async def cmd_disconnect(bot, uid, chat, arg):
@@ -745,33 +867,51 @@ async def cmd_cancel(bot, uid, chat, arg):
 async def cmd_users(bot, uid, chat, arg):
     reg = load_reg()
     ids = sorted(set([ADMIN] + [int(k) for k in reg["allowed"]] + connected_users()))
-    rows = []
+    rows, total = [], 0.0
     for u in ids:
         inst = INSTANCES.get(u)
         state_ = "🟢" if inst and inst.running else ("⚠️" if inst and inst.failed else ("🔴" if has_session(u) else "⚪️"))
+        mem = inst.rss() if inst else None
+        total += mem or 0
         name = reg["allowed"].get(str(u), {}).get("name", "ادمین" if u == ADMIN else "")
-        rows.append(f"{state_} <code>{u}</code> {html.escape(name or '')}")
-    await bot.send(chat, f"👥 کاربرها ({len(connected_users())}/{MAX_USERS} وصل)\n\n" + "\n".join(rows) +
-                   "\n\n🟢 در حال اجرا · 🔴 متوقف · ⚪️ اکانت وصل نکرده")
+        rows.append(f"{state_} <code>{u}</code> {html.escape(name or '')} · {sub_text(u)}" + (f" · {mem:.0f}MB" if mem else ""))
+    await bot.send(chat, f"👥 کاربرها ({len(connected_users())}/{MAX_USERS} وصل" + (f" · رم کل {total:.0f}MB" if total else "") + ")\n\n" +
+                   "\n".join(rows) + "\n\n🟢 در حال اجرا · 🔴 متوقف · ⚪️ اکانت وصل نکرده")
 
 
 async def cmd_allow(bot, uid, chat, arg):
-    parts = arg.split(maxsplit=1)
+    parts = arg.split(maxsplit=2)
     if not parts or not parts[0].isdigit():
-        return await bot.send(chat, "مثال: <code>/allow 123456789 علی</code>")
-    target = int(parts[0])
-    allow_user(target, parts[1] if len(parts) > 1 else "")
-    await bot.send(chat, f"✅ دسترسی <code>{target}</code> داده شد")
+        return await bot.send(chat, "مثال: <code>/allow 123456789 30 علی</code> (۳۰ روز؛ بدون عدد یا ۰ = نامحدود)")
+    target, days, name = int(parts[0]), 0, ""
+    rest = parts[1:]
+    if rest and rest[0].isdigit():
+        days, name = int(rest[0]), (rest[1] if len(rest) > 1 else "")
+    elif rest:
+        name = " ".join(rest)
+    allow_user(target, name, days)
+    revive(target)
+    dur = f"{days} روز" if days else "نامحدود"
+    await bot.send(chat, f"✅ دسترسی <code>{target}</code> داده شد ({dur})")
     try:
-        await bot.send(target, "✅ ادمین دسترسی‌ات رو تأیید کرد. /connect برای وصل کردن اکانت یا /help")
+        await bot.send(target, f"✅ ادمین دسترسی‌ات رو تأیید کرد ({dur}). /connect برای وصل کردن اکانت یا /help")
     except Exception:  # noqa
         pass
 
 
-def allow_user(target, name=""):
-    reg = load_reg()
-    reg["allowed"][str(target)] = {"name": name, "since": int(time.time())}
-    save_reg(reg)
+async def cmd_extend(bot, uid, chat, arg):
+    parts = arg.split()
+    if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()) or int(parts[1]) <= 0:
+        return await bot.send(chat, "مثال: <code>/extend 123456789 30</code> (۳۰ روز اضافه)")
+    target, days = int(parts[0]), int(parts[1])
+    if not extend_user(target, days):
+        return await bot.send(chat, "❌ این کاربر توی لیست نیست (اول /allow)")
+    revive(target)
+    await bot.send(chat, f"✅ اشتراک <code>{target}</code> {days} روز تمدید شد ({sub_text(target)})")
+    try:
+        await bot.send(target, f"✅ اشتراکت {days} روز تمدید شد ({sub_text(target)}).")
+    except Exception:  # noqa
+        pass
 
 
 async def cmd_revoke(bot, uid, chat, arg):
@@ -786,8 +926,22 @@ async def cmd_revoke(bot, uid, chat, arg):
     inst = INSTANCES.get(target)
     if inst:
         await inst.stop()
-    open(stopped_marker(target), "w").close() if os.path.isdir(udir(target)) else None
     await bot.send(chat, f"✅ دسترسی <code>{target}</code> گرفته شد و سلفش متوقف شد (اطلاعاتش می‌مونه؛ حذف کامل: خودش /disconnect بزنه)")
+
+
+async def cmd_broadcast(bot, uid, chat, arg):
+    if not arg.strip():
+        return await bot.send(chat, "مثال: <code>/broadcast ساعت ۱۲ سرور ریستارت می‌شه</code>")
+    targets = ({int(k) for k in load_reg()["allowed"]} | set(connected_users())) - {ADMIN}
+    ok = bad = 0
+    for t in sorted(targets):
+        try:
+            await bot.send(t, "📢 <b>پیام ادمین</b>\n\n" + html.escape(arg.strip()))
+            ok += 1
+        except Exception:  # noqa
+            bad += 1
+        await asyncio.sleep(0.05)
+    await bot.send(chat, f"📢 ارسال شد: {ok} موفق" + (f" · {bad} ناموفق (بات رو بلاک کرده‌ن)" if bad else ""))
 
 
 async def cmd_log(bot, uid, chat, arg):
@@ -796,6 +950,38 @@ async def cmd_log(bot, uid, chat, arg):
     lines = list(inst.logs)[-25:] if inst else []
     body = html.escape("\n".join(lines)[-3500:]) or "—"
     await bot.send(chat, f"📜 لاگ <code>{target}</code>:\n<pre>{body}</pre>")
+
+
+async def cmd_backup(bot, uid, chat, arg):
+    data = sanitized_settings(uid)
+    if data is None:
+        return await bot.send(chat, "🔌 هنوز تنظیماتی نداری (اول /connect)")
+    raw = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+    name = f"self-backup-{datetime.datetime.now():%Y%m%d}.json"
+    await bot.upload("sendDocument", {"chat_id": chat, "caption": "💾 پشتیبان تنظیمات سلفت (بدون توکن و پروکسی).\nبرگردوندن: همین فایل رو با کپشن /restore بفرست."},
+                     "document", name, raw)
+
+
+async def cmd_restore(bot, uid, chat, arg):
+    if arg.strip().lower() == "last":
+        p = latest_backup(uid)
+        if not p:
+            return await bot.send(chat, "❌ بکاپ خودکاری برات ثبت نشده")
+        return await bot.send(chat, "✅ " + await do_restore(uid, read_json(p, None)))
+    await bot.send(chat, "برای برگردوندن: فایل پشتیبان (.json) رو با کپشن <code>/restore</code> بفرست، یا <code>/restore last</code> برای آخرین بکاپ خودکار.")
+
+
+async def restore_from_doc(bot, uid, chat, doc):
+    if doc.get("file_size", 0) > 2_000_000 or not str(doc.get("file_name", "")).lower().endswith(".json"):
+        return await bot.send(chat, "❌ فقط فایل .json کمتر از ۲ مگابایت")
+    info = await bot.api("getFile", file_id=doc["file_id"])
+    async with bot.s.get(f"https://api.telegram.org/file/bot{TOKEN}/{info['file_path']}") as r:
+        raw = await r.read()
+    try:
+        msg = await do_restore(uid, json.loads(raw.decode("utf-8")))
+    except (ValueError, UnicodeDecodeError) as e:
+        return await bot.send(chat, f"❌ فایل معتبر نیست: {html.escape(str(e))[:200]}")
+    await bot.send(chat, "✅ " + msg)
 
 
 async def do_update(bot, uid, chat, doc):
@@ -823,9 +1009,258 @@ async def do_update(bot, uid, chat, doc):
     updater.restart()
 
 
+# ───────────── بکاپ ─────────────
+def sanitized_settings(uid):
+    """تنظیمات سلف بدون چیزهای حساس (توکن بات و پروکسی)."""
+    data = read_json(upath(uid, "settings.json"), None)
+    if not isinstance(data, dict):
+        return None
+    cfg = {k: v for k, v in (data.get("cfg") or {}).items() if k not in ("bot_token", "proxy")}
+    return {"features": data.get("features") or {}, "cfg": cfg}
+
+
+def backup_dir(uid):
+    return os.path.join(DATA, "backups", str(uid))
+
+
+def make_backup(uid):
+    data = sanitized_settings(uid)
+    if data is None:
+        return None
+    d = backup_dir(uid)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".json")
+    write_json(path, data)
+    for old in sorted(os.listdir(d))[:-BACKUP_KEEP]:
+        try:
+            os.remove(os.path.join(d, old))
+        except OSError:
+            pass
+    return path
+
+
+def latest_backup(uid):
+    d = backup_dir(uid)
+    try:
+        files = sorted(f for f in os.listdir(d) if f.endswith(".json"))
+    except OSError:
+        return None
+    return os.path.join(d, files[-1]) if files else None
+
+
+def validate_backup(obj):
+    """(features, cfg) تمیز‌شده یا ValueError."""
+    if not isinstance(obj, dict) or not isinstance(obj.get("features"), dict) or not isinstance(obj.get("cfg"), dict):
+        raise ValueError("ساختار فایل پشتیبان درست نیست (باید features و cfg داشته باشه)")
+    feats = {k: bool(v) for k, v in obj["features"].items() if k in DEFAULT_FLAGS and k not in HIDDEN}
+    cfg = {k: v for k, v in obj["cfg"].items() if k not in ("bot_token", "proxy")}
+    return feats, cfg
+
+
+async def do_restore(uid, obj) -> str:
+    feats, cfg = validate_backup(obj)
+    inst = INSTANCES.get(uid)
+    was_running = bool(inst and inst.running)
+    if inst:
+        await inst.stop()
+    make_backup(uid)  # نسخه‌ی فعلی قبل از جایگزینی
+    write_json(upath(uid, "settings.json"), {"features": feats, "cfg": cfg})
+    if has_session(uid) and (was_running or not os.path.exists(stopped_marker(uid))) and is_allowed(uid):
+        get_instance(uid).start()
+    return f"{len(feats)} قابلیت و {len(cfg)} تنظیم برگشت"
+
+
+async def backup_all():
+    for uid in connected_users():
+        try:
+            make_backup(uid)
+        except Exception as e:  # noqa
+            log.warning("[u%s] backup failed: %r", uid, e)
+
+
+# ───────────── انقضای اشتراک ─────────────
+async def check_expiry(bot):
+    reg = load_reg()
+    now = time.time()
+    changed = False
+    for k, e in reg["allowed"].items():
+        exp = e.get("expires", 0)
+        if not exp:
+            continue
+        uid, left = int(k), exp - now
+        try:
+            if left <= 0:
+                if not e.get("expired"):
+                    e["expired"], changed = True, True
+                    inst = INSTANCES.get(uid)
+                    if inst:
+                        await inst.stop()  # is_allowed خودش جلوی بالا اومدن دوباره رو می‌گیره
+                    await bot.send(uid, "⌛ اشتراکت تموم شد و سلفت متوقف شد (اطلاعاتت می‌مونه). برای تمدید به ادمین پیام بده و /start بزن.")
+                    await bot.send(ADMIN, f"⌛ اشتراک <code>{uid}</code> {html.escape(e.get('name', ''))} تموم شد. تمدید: <code>/extend {uid} 30</code>")
+            elif left <= DAY and not e.get("warn1"):
+                e["warn1"] = e["warn3"] = True
+                changed = True
+                await bot.send(uid, "⏰ کمتر از ۱ روز از اشتراکت مونده. برای تمدید به ادمین پیام بده.")
+            elif left <= 3 * DAY and not e.get("warn3"):
+                e["warn3"], changed = True, True
+                await bot.send(uid, f"⏰ {-(-int(left) // DAY)} روز از اشتراکت مونده. برای تمدید به ادمین پیام بده.")
+        except Exception as ex:  # noqa
+            log.warning("expiry notify failed for %s: %r", uid, ex)
+    if changed:
+        save_reg(reg)
+
+
+# ───────────── نگهبان رم و انتقال هشدارها ─────────────
+_rss_alert = {}
+
+
+async def watchdog(bot):
+    if not MAX_RSS_MB:
+        return
+    for uid, inst in list(INSTANCES.items()):
+        m = inst.rss()
+        if m and m > MAX_RSS_MB:
+            log.warning("[u%s] RSS %.0fMB > %sMB → restart", uid, m, MAX_RSS_MB)
+            await inst.stop()
+            inst.start()
+            if time.time() - _rss_alert.get(uid, 0) > 1800:
+                _rss_alert[uid] = time.time()
+                for target in {uid, ADMIN}:
+                    try:
+                        await bot.send(target, f"🧠 سلف <code>{uid}</code> بیش از حد رم مصرف کرد ({m:.0f}MB > {MAX_RSS_MB}MB) و ریستارت شد.")
+                    except Exception:  # noqa
+                        pass
+
+
+async def relay_alerts(bot):
+    """هشدارهایی که سلف‌ها توی alerts.jsonl نوشتن رو با بات برای صاحبشون می‌فرسته."""
+    for uid in list(INSTANCES):
+        p = upath(uid, "alerts.jsonl")
+        if not os.path.exists(p):
+            continue
+        work = p + ".work"
+        try:
+            os.replace(p, work)
+        except OSError:
+            continue
+        texts = []
+        try:
+            with open(work, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        texts.append(json.loads(line)["text"])
+                    except (ValueError, KeyError):
+                        pass
+        finally:
+            try:
+                os.remove(work)
+            except OSError:
+                pass
+        if texts:
+            extra = f"\n\n… و {len(texts) - 8} هشدار دیگه" if len(texts) > 8 else ""
+            try:
+                await bot.send(uid, "\n\n".join(texts[:8]) + extra)
+            except Exception as e:  # noqa
+                log.warning("[u%s] alert relay failed: %r", uid, e)
+
+
+async def maintenance():
+    n = 0
+    while True:
+        await asyncio.sleep(5)
+        n += 1
+        bot = _bot_ref.get("bot")
+        if not bot:
+            continue
+        try:
+            await relay_alerts(bot)
+            if n % 12 == 0:
+                await watchdog(bot)
+            if n % 120 == 0:
+                await check_expiry(bot)
+            if n % max(1, int(BACKUP_HOURS * 3600 / 5)) == 60:  # اولین بکاپ ~۵ دقیقه بعد از شروع
+                await backup_all()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa
+            log.warning("hub maintenance: %r", e)
+
+
+# ───────────── ورود با QR ─────────────
+QR_CAPTION = ("🔳 <b>ورود با QR</b>\n\n"
+              "توی یه دستگاه دیگه‌ی همین اکانت: تلگرام ← Settings ← Devices ← <b>Link Desktop Device</b> ← این QR رو اسکن کن.\n"
+              "هر ۳۰ ثانیه خودکار نو می‌شه. لغو: /cancel")
+
+
+def make_qr_png(url: str) -> bytes:
+    import qrcode
+    q = qrcode.QRCode(box_size=8, border=3)
+    q.add_data(url)
+    q.make(fit=True)
+    buf = io.BytesIO()
+    q.make_image(fill_color="black", back_color="white").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def start_qr(bot, uid, chat):
+    await cleanup_login(uid)
+    try:
+        make_qr_png("tg://login?token=x")
+    except ImportError:
+        return await bot.send(chat, "❌ ورود با QR روی این سرور فعال نیست (کتابخونه‌ی qrcode نصب نیست). با شماره وارد شو.")
+    client = make_client()
+    await client.connect()
+    qr = await client.qr_login()
+    res = await bot.upload("sendPhoto", {"chat_id": chat, "caption": QR_CAPTION, "parse_mode": "HTML"}, "photo", "qr.png", make_qr_png(qr.url))
+    st = {"step": "qr", "ts": time.time(), "chat": chat, "client": client, "qr": qr, "mid": res.get("message_id")}
+    LOGIN[uid] = st
+    st["task"] = asyncio.create_task(qr_wait(bot, uid))
+
+
+async def qr_wait(bot, uid):
+    st = LOGIN.get(uid)
+    if not st:
+        return
+    chat = st["chat"]
+    try:
+        for i in range(6):  # حدود ۳ دقیقه
+            try:
+                await st["qr"].wait(30)
+            except asyncio.TimeoutError:
+                if LOGIN.get(uid) is not st:
+                    return
+                if i == 5:  # دور آخر: دیگه نو نمی‌کنیم
+                    break
+                await st["qr"].recreate()
+                st["ts"] = time.time()
+                await bot.upload("editMessageMedia", {
+                    "chat_id": chat, "message_id": st["mid"],
+                    "media": json.dumps({"type": "photo", "media": "attach://file", "caption": QR_CAPTION, "parse_mode": "HTML"})},
+                    "file", "qr.png", make_qr_png(st["qr"].url))
+                continue
+            except SessionPasswordNeededError:
+                st["step"] = "pw"
+                return await bot.send(chat, "🔐 رمز تأیید دومرحله‌ای (2FA) رو بفرست. پیامت بعد از خوندن پاک می‌شه.")
+            if st.get("mid"):
+                await bot.delete(chat, st["mid"])
+            return await finish_login(bot, uid, chat)
+        await cleanup_login(uid)
+        await bot.send(chat, "⌛ QR منقضی شد. دوباره /connect")
+    except asyncio.CancelledError:
+        raise
+    except FloodWaitError as e:
+        await cleanup_login(uid)
+        await bot.send(chat, f"⏳ تلگرام موقتاً محدود کرد؛ {fmt_dur(e.seconds)} دیگه امتحان کن.")
+    except Exception as e:  # noqa
+        log.warning("[u%s] qr login failed: %r", uid, e)
+        await cleanup_login(uid)
+        await bot.send(chat, "❌ ورود با QR انجام نشد. دوباره /connect یا با شماره وارد شو.")
+
+
 USER_CMDS = {"/panel": cmd_panel, "/status": cmd_status, "/cmd": cmd_cmd, "/restart": cmd_restart, "/stop": cmd_stop,
-             "/run": cmd_run, "/disconnect": cmd_disconnect, "/cancel": cmd_cancel}
-ADMIN_CMDS = {"/users": cmd_users, "/allow": cmd_allow, "/revoke": cmd_revoke, "/log": cmd_log}
+             "/run": cmd_run, "/disconnect": cmd_disconnect, "/cancel": cmd_cancel, "/backup": cmd_backup, "/restore": cmd_restore}
+ADMIN_CMDS = {"/users": cmd_users, "/allow": cmd_allow, "/extend": cmd_extend, "/revoke": cmd_revoke, "/log": cmd_log,
+              "/broadcast": cmd_broadcast}
 
 
 async def request_access(bot, msg):
@@ -837,10 +1272,14 @@ async def request_access(bot, msg):
     if now - REQ_TS.get(uid, 0) < 3600:
         return await bot.send(chat, "⏳ درخواستت قبلاً برای ادمین رفته؛ منتظر تأیید باش.")
     REQ_TS[uid] = now
-    await bot.send(chat, f"🔒 این بات خصوصیه. آیدی تو: <code>{uid}</code>\nدرخواستت برای ادمین ارسال شد.")
+    renew = get_entry(uid) is not None  # قبلاً کاربر بوده و اشتراکش تموم شده
+    if renew:
+        await bot.send(chat, f"⌛ اشتراکت تموم شده. درخواست تمدید برای ادمین رفت. آیدی تو: <code>{uid}</code>")
+    else:
+        await bot.send(chat, f"🔒 این بات خصوصیه. آیدی تو: <code>{uid}</code>\nدرخواستت برای ادمین ارسال شد.")
     if ADMIN:
-        await bot.send(ADMIN, f"🔔 درخواست دسترسی\nنام: {html.escape(name)}\nیوزرنیم: {html.escape(uname)}\nآیدی: <code>{uid}</code>",
-                       ACCESS_KB(uid))
+        await bot.send(ADMIN, f"{'🔄 درخواست تمدید' if renew else '🔔 درخواست دسترسی'}\nنام: {html.escape(name)}\n"
+                              f"یوزرنیم: {html.escape(uname)}\nآیدی: <code>{uid}</code>", ACCESS_KB(uid))
 
 
 async def on_message(bot, msg):
@@ -853,6 +1292,10 @@ async def on_message(bot, msg):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     if uid == ADMIN and msg.get("document") and text.split("@")[0].lower().startswith("/update"):
         return await do_update(bot, uid, cid, msg["document"])
+    if msg.get("document") and text.split("@")[0].lower().startswith("/restore"):
+        if not has_session(uid):
+            return await bot.send(cid, "🔌 اول /connect")
+        return await restore_from_doc(bot, uid, cid, msg["document"])
     if uid in LOGIN and not text.startswith("/"):
         return await handle_login(bot, msg)
     if not text.startswith("/"):
@@ -876,14 +1319,18 @@ async def on_callback(bot, q):
     if not is_allowed(uid) and not (uid == ADMIN):
         return await bot.answer(q["id"], "دسترسی نداری 🚫")
     kind, _, rest = data.partition(":")
-    if kind in ("ok", "no") and uid == ADMIN and rest.isdigit():
-        target = int(rest)
+    if kind in ("ok", "no") and uid == ADMIN and rest.split(":")[0].isdigit():
+        parts = rest.split(":")
+        target = int(parts[0])
         if kind == "ok":
-            allow_user(target, "")
+            days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            allow_user(target, "", days)
+            revive(target)
+            dur = f"{days} روز" if days else "نامحدود"
             await bot.answer(q["id"], "✅ تأیید شد")
-            await bot.edit(cid, mid, f"✅ دسترسی <code>{target}</code> تأیید شد")
+            await bot.edit(cid, mid, f"✅ دسترسی <code>{target}</code> تأیید شد ({dur})")
             try:
-                await bot.send(target, "✅ ادمین دسترسی‌ات رو تأیید کرد. /connect برای وصل کردن اکانت یا /help")
+                await bot.send(target, f"✅ ادمین دسترسی‌ات رو تأیید کرد ({dur}). /connect برای وصل کردن اکانت یا /help")
             except Exception:  # noqa
                 pass
         else:
@@ -892,8 +1339,15 @@ async def on_callback(bot, q):
         return
     if data == "go":
         await bot.answer(q["id"])
-        await bot.edit(cid, mid, "👍 ادامه...")
+        return await bot.edit(cid, mid, "چطور وارد بشی؟\n\n🔳 <b>QR</b>: نیاز به یه دستگاه دیگه‌ی لاگین (بدون کد، بدون خطر باطل شدن)\n📱 <b>شماره</b>: کد تلگرام رو با خط تیره می‌فرستی", METHOD_KB)
+    if data == "ph":
+        await bot.answer(q["id"])
+        await bot.edit(cid, mid, "👍 با شماره")
         return await ask_phone(bot, uid, cid)
+    if data == "qr":
+        await bot.answer(q["id"])
+        await bot.edit(cid, mid, "👍 با QR")
+        return await start_qr(bot, uid, cid)
     if data == "dc":
         await bot.answer(q["id"], "در حال حذف...")
         await do_disconnect(uid)
@@ -965,7 +1419,8 @@ async def health(request):
 async def on_startup(app):
     migrate_admin()
     kill_stale()
-    app["tasks"] = [asyncio.create_task(poll(app)), asyncio.create_task(start_all()), asyncio.create_task(updater.mark_healthy())]
+    app["tasks"] = [asyncio.create_task(poll(app)), asyncio.create_task(start_all()), asyncio.create_task(updater.mark_healthy()),
+                     asyncio.create_task(maintenance())]
 
 
 async def on_cleanup(app):
