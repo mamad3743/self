@@ -1,10 +1,15 @@
 """هاب چندکاربره: یه بات مشترک؛ هر کس اکانت خودش رو وصل می‌کنه و سلفش توی یه پردازش جدا اجرا می‌شه.
 
+مدل تک‌بات: هیچ کاربری بات جدا (BotFather) نمی‌خواد؛ فقط همین یه بات (HUB_BOT_TOKEN) برای همه‌ست.
+داخل بات: اتصال اکانت، پنل قابلیت‌ها + بازی میویی، روشن/خاموش/ریستارت سلف،
+پشتیبان‌گیری کامل و بازیابی، راهنمای دیپلوی روی Railway، و مینی‌اپ (WebApp) برای هر نفر.
+
 فعال‌سازی (متغیرهای Railway):
-  HUB_BOT_TOKEN = توکن بات (BotFather)      HUB_ADMIN_ID = آیدی عددی تو
+  HUB_BOT_TOKEN = توکن بات مشترک (BotFather)      HUB_ADMIN_ID = آیدی عددی تو (ادمین)
   API_ID / API_HASH = اختیاری (از my.telegram.org)  MAX_USERS = سقف کاربر (پیش‌فرض ۵)
   HUB_DIR = پوشه‌ی داده (پیش‌فرض /data/hub)   PROXY = اختیاری
   MAX_RSS_MB = سقف رم هر سلف (۰ = بدون سقف)   BACKUP_HOURS = فاصله‌ی بکاپ خودکار (پیش‌فرض ۲۴)
+  HUB_DOMAIN = دامنه‌ی عمومی Railway (مثل xxx.up.railway.app) برای دکمه‌ی مینی‌اپ (اختیاری)
 
 هر کاربر: /data/hub/<id>/ شامل session.txt، settings.json، ctl.jsonl (صف دستور)، status.json.
 دستورهای نقطه‌ای (.میویی و...) توی چت‌های خود کاربر مثل قبل کار می‌کنن؛ بات برای اتصال، پنل، وضعیت و مدیریته.
@@ -15,14 +20,19 @@ import re
 import sys
 import json
 import time
+import hmac
 import html
+import hashlib
 import datetime
 import shutil
 import signal
 import socket
 import asyncio
 import secrets
+import zipfile
+import tempfile
 import collections
+import urllib.parse
 
 os.environ.setdefault("PANEL_PASSWORD", secrets.token_hex(12))  # core موقع import لازم داره
 
@@ -58,6 +68,7 @@ BACKUP_KEEP = 7
 DAY = 86400
 API_ID = 0
 API_HASH = ""
+DOMAIN = ""
 INSTANCES = {}
 LOGIN = {}  # uid -> وضعیت مراحل ورود
 REQ_TS = {}  # uid -> زمان آخرین درخواست دسترسی
@@ -75,7 +86,7 @@ SNIPPET = (
 
 
 def configure(env=None):
-    global TOKEN, ADMIN, DATA, MAX_USERS, API_ID, API_HASH, MAX_RSS_MB, BACKUP_HOURS
+    global TOKEN, ADMIN, DATA, MAX_USERS, API_ID, API_HASH, MAX_RSS_MB, BACKUP_HOURS, DOMAIN
     env = env if env is not None else os.environ
     TOKEN = env.get("HUB_BOT_TOKEN", "")
     ADMIN = int(env.get("HUB_ADMIN_ID") or 0)
@@ -83,10 +94,18 @@ def configure(env=None):
     MAX_USERS = int(env.get("MAX_USERS") or 5)
     MAX_RSS_MB = int(env.get("MAX_RSS_MB") or 0)
     BACKUP_HOURS = int(env.get("BACKUP_HOURS") or 24)
+    DOMAIN = (env.get("HUB_DOMAIN") or env.get("RAILWAY_PUBLIC_DOMAIN") or "").strip().rstrip("/")
+    if DOMAIN and not DOMAIN.startswith("http"):
+        DOMAIN = "https://" + DOMAIN
     core.load_api()
     API_ID = int(env.get("API_ID") or 0) or core.API["id"]
     API_HASH = env.get("API_HASH") or core.API["hash"]
     os.makedirs(DATA, exist_ok=True)
+
+
+def app_base_url() -> str:
+    """آدرس پایه‌ی مینی‌اپ (خالی = مینی‌اپ غیرفعال)."""
+    return (DOMAIN.rstrip("/") + "/app") if DOMAIN else ""
 
 
 # ───────────── ذخیره‌سازی ─────────────
@@ -484,14 +503,21 @@ def status_text(uid) -> str:
     return "\n".join(lines)
 
 
+def is_running(uid) -> bool:
+    inst = INSTANCES.get(uid)
+    return bool(inst and inst.running)
+
+
 def main_text(uid) -> str:
     flags = read_flags(uid)
     on = sum(1 for k, v in flags.items() if v and k not in HIDDEN)
-    return ("⚙️ <b>پنل سلف تو</b>\n"
-            f"✔ {len(FEATS) - len(HIDDEN)} قابلیت ({on} روشن)\n"
+    run = "🟢 روشن" if is_running(uid) else "🔴 خاموش"
+    return ("⚙️ <b>پنل سلف تو</b> — یه بات برای همه (بدون نیاز به بات جدا)\n"
+            f"🤖 سلف: {run} · ✔ {len(FEATS) - len(HIDDEN)} قابلیت ({on} روشن)\n"
             "🟢 روشن   🔴 خاموش   🔵 دستوری\n\n"
             "روی هر دکمه بزن تا راهنما ببینی یا روشن/خاموشش کنی.\n"
-            "دستورهای چت‌محور مثل <code>.میویی</code> رو توی همون چت بزن.")
+            "دستورهای چت‌محور مثل <code>.میویی</code> رو توی همون چت بزن.\n"
+            "مدیریت کامل (روشن/خاموش، بکاپ، دیپلوی، مینی‌اپ) همین‌جاست 👇")
 
 
 def feat_style(f, flags) -> str:
@@ -500,9 +526,28 @@ def feat_style(f, flags) -> str:
     return "success" if flags.get(f["key"]) else "danger"
 
 
+def manage_keyboard(uid) -> list:
+    """ردیف‌های مدیریتی بالای پنل: وضعیت/روشن/خاموش/ریستارت/بکاپ/مینی‌اپ/دیپلوی."""
+    running = is_running(uid)
+    rows = [
+        [botpanel.btn("📊 وضعیت", "mg:status", "primary"),
+         botpanel.btn("🔴 خاموش", "mg:stop", "danger") if running else botpanel.btn("🟢 روشن", "mg:run", "success"),
+         botpanel.btn("🔄 ریستارت", "mg:restart", "primary")],
+        [botpanel.btn("💾 بکاپ", "mg:backup", "primary"),
+         botpanel.btn("♻️ بازیابی آخر", "mg:restore_last", "primary"),
+         botpanel.btn("🚀 دیپلوی", "mg:deploy", "primary")],
+    ]
+    url = app_base_url()
+    if url:
+        rows.append([{"text": "📱 باز کردن مینی‌اپ", "web_app": {"url": url}}])
+    else:
+        rows.append([botpanel.btn("📱 مینی‌اپ", "mg:app", "primary")])
+    return rows
+
+
 def main_keyboard(uid) -> dict:
     flags = read_flags(uid)
-    rows = []
+    rows = manage_keyboard(uid)
     for row in GRID:
         keys = [k for k in row if k not in HIDDEN]
         if not keys:
@@ -511,6 +556,38 @@ def main_keyboard(uid) -> dict:
         rows.append(list(reversed(btns)))
     rows.append([botpanel.btn("❌ بستن پنل", "x", "danger")])
     return {"inline_keyboard": rows}
+
+
+DEPLOY_TEXT = (
+    "🚀 <b>دیپلوی سلف روی Railway</b>\n\n"
+    "این بات خودش روی Railway بالاست؛ لازم نیست هر نفر بات جدا بزنه — همین یه بات برای همه‌ست.\n\n"
+    "<b>اگه می‌خوای برای خودت یه هاب جدا بالا بیاری:</b>\n"
+    "1️⃣ ریپو رو توی GitHub بذار (خصوصی)\n"
+    "2️⃣ Railway ← New → Deploy from GitHub\n"
+    "3️⃣ Variables:\n"
+    "<code>HUB_BOT_TOKEN</code> = توکن باتت از @BotFather\n"
+    "<code>HUB_ADMIN_ID</code> = آیدی عددیت از @userinfobot\n"
+    "<code>API_ID</code> / <code>API_HASH</code> = از my.telegram.org (اختیاری ولی پیشنهادی)\n"
+    "<code>HUB_DOMAIN</code> = دامنه‌ی Railway (برای دکمه‌ی مینی‌اپ، اختیاری)\n"
+    "<code>MAX_USERS</code> = سقف کاربر (مثلاً 5)\n"
+    "4️⃣ Volume با Mount Path = <code>/data</code> بساز\n"
+    "5️⃣ Settings ← Networking ← Generate Domain\n\n"
+    "بعدش بات رو باز کن و /start بزن. خودت ادمینی و بقیه با تأیید تو وارد می‌شن.\n\n"
+    "💡 <b>مدیریت سلفت از همین‌جا:</b> /run روشن · /stop خاموش · /restart ریستارت · /status وضعیت · /backup بکاپ · /restore بازیابی"
+)
+
+MINIAPP_HELP = (
+    "📱 <b>مینی‌اپ سلف</b>\n\n"
+    "از مینی‌اپ می‌تونی بدون دستور تایپ کردن کارت رو بکنی:\n"
+    "• دیدن وضعیت و رم و آپتایم\n"
+    "• روشن/خاموش/ریستارت سلف\n"
+    "• روشن/خاموش کردن همه‌ی قابلیت‌ها + بازی‌ها (میویی، ماهیگیری، یخچال، پیشی، خفاش، نجات)\n"
+    "• اجرای دستور توی یه چت (مثلاً <code>.میویی</code> توی گروه بازی)\n"
+    "• دانلود بکاپ و آپلود برای بازیابی\n\n"
+    "{app_line}\n"
+    "فعال‌سازی برای ادمین: توی @BotFather دستور /newapp یا /editapp ← Web App URL رو بذار روی:\n<code>{app_url}</code>\n"
+    "یا متغیر <code>HUB_DOMAIN</code> رو توی Railway ست کن تا دکمه‌ی «باز کردن مینی‌اپ» زیر پنل بیاد."
+)
 
 
 def feat_text(uid, key) -> str:
@@ -530,22 +607,27 @@ def feat_keyboard(key) -> dict:
 
 
 HELP = (
-    "🐾 <b>هاب سلف</b>\n\n"
-    "اکانتت رو وصل می‌کنی، سلف مخصوص خودت روی سرور اجرا می‌شه و از همین بات کنترلش می‌کنی.\n\n"
-    "/connect ← وصل کردن اکانت\n"
-    "/panel ← پنل روشن/خاموش قابلیت‌ها\n"
+    "🐾 <b>هاب سلف — یه بات برای همه</b>\n\n"
+    "لازم نیست بات جدا بزنی؛ همین یه بات برای تو و بقیه‌ست. اکانتت رو وصل می‌کنی، "
+    "سلف مخصوص خودت روی سرور (Railway) اجرا می‌شه و از همین‌جا + مینی‌اپ کنترلش می‌کنی.\n\n"
+    "/connect ← وصل کردن اکانت (QR یا شماره)\n"
+    "/panel ← پنل مدیریتی (روشن/خاموش سلف، قابلیت‌ها، بازی، بکاپ، دیپلوی، مینی‌اپ)\n"
     "/status ← وضعیت سلفت\n"
+    "/app ← لینک مینی‌اپ (کنترل لمسی کامل)\n"
+    "/deploy ← آموزش دیپلوی همین هاب روی Railway خودت\n"
     "/cmd ← اجرای دستور توی یه چت، مثلاً <code>/cmd me .وضعیت چت</code> یا <code>/cmd @group .میویی</code>\n"
-    "/restart ، /stop ، /run ← مدیریت سلف\n"
-    "/backup ← فایل پشتیبان تنظیمات · /restore ← برگردوندن (فایل با کپشن /restore یا <code>/restore last</code>)\n"
+    "/run · /stop · /restart ← روشن / خاموش / ریستارت سلف\n"
+    "/backup ← بکاپ تنظیمات · /backup_full ← بکاپ کامل (تنظیمات + سشن، زیپ)\n"
+    "/restore ← بازیابی (فایل json/zip با کپشن /restore یا <code>/restore last</code>)\n"
     "/disconnect ← خروج کامل و حذف اطلاعات\n\n"
-    "بعد از وصل شدن، دستورهای نقطه‌ای (<code>.میویی</code> <code>.ماهیگیری</code> و...) رو توی خود تلگرامت بزن."
+    "بعد از وصل شدن، دستورهای نقطه‌ای (<code>.میویی</code> <code>.ماهیگیری</code> <code>.یخچال</code> <code>.پیشی</code> <code>.خفاش</code> <code>.نجات</code> و...) رو توی خود تلگرامت بزن."
 )
 ADMIN_HELP = (
     "\n\n<b>ادمین:</b>\n/users ← لیست کاربرها (اشتراک و رم)\n/allow &lt;id&gt; [روز] [نام] ← دسترسی (بدون روز = نامحدود)\n"
     "/extend &lt;id&gt; &lt;روز&gt; ← تمدید · /revoke &lt;id&gt; ← گرفتن دسترسی\n"
     "/stop · /run · /restart &lt;id&gt; ← مدیریت سلف هر کاربر · /log [id] ← لاگ\n"
-    "/broadcast &lt;متن&gt; ← پیام به همه\nبروزرسانی: فایل زیپ رو با کپشن <code>/update</code> بفرست"
+    "/broadcast &lt;متن&gt; ← پیام به همه · /dump ← بکاپ کامل همه‌ی کاربرها (زیپ، ادمین)\n"
+    "بروزرسانی: فایل زیپ رو با کپشن <code>/update</code> بفرست"
 )
 CONSENT = (
     "⚠️ <b>قبل از وصل کردن اکانت بخون</b>\n\n"
@@ -785,7 +867,15 @@ async def cmd_panel(bot, uid, chat, arg):
 
 
 async def cmd_status(bot, uid, chat, arg):
-    await bot.send(chat, status_text(uid))
+    t = tgt(uid, arg) if arg.strip().isdigit() else uid
+    if uid != ADMIN and t != uid:
+        t = uid
+    kb = {"inline_keyboard": [
+        [botpanel.btn("🔄 ریستارت", "mg:restart", "primary"),
+         botpanel.btn("🔴 خاموش", "mg:stop", "danger") if is_running(t) else botpanel.btn("🟢 روشن", "mg:run", "success")],
+        [botpanel.btn("🎛 پنل", "m", "primary"), botpanel.btn("💾 بکاپ", "mg:backup", "primary")],
+    ]}
+    await bot.send(chat, status_text(t), kb)
 
 
 async def cmd_cmd(bot, uid, chat, arg):
@@ -984,8 +1074,82 @@ async def cmd_backup(bot, uid, chat, arg):
         return await bot.send(chat, "🔌 هنوز تنظیماتی نداری (اول /connect)")
     raw = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
     name = f"self-backup-{datetime.datetime.now():%Y%m%d}.json"
-    await bot.upload("sendDocument", {"chat_id": chat, "caption": "💾 پشتیبان تنظیمات سلفت (بدون توکن و پروکسی).\nبرگردوندن: همین فایل رو با کپشن /restore بفرست."},
+    await bot.upload("sendDocument", {"chat_id": chat, "caption": "💾 پشتیبان تنظیمات سلفت (بدون سشن، بدون توکن و پروکسی).\nبرگردوندن: همین فایل رو با کپشن /restore بفرست.\nبکاپ کامل (با سشن): /backup_full"},
                      "document", name, raw)
+
+
+async def cmd_backup_full(bot, uid, chat, arg):
+    """بکاپ کامل: settings.json + session.txt + api.json توی یه زیپ. خیلی حساسه — جایی فوروارد نکن."""
+    if not has_session(uid):
+        return await bot.send(chat, "🔌 هنوز اکانتی وصل نکردی (اول /connect)")
+    make_backup(uid)  # یه نسخه‌ی امن هم توی بکاپ‌های خودکار بمونه
+    tmp = tempfile.mkdtemp(prefix="fullbak_")
+    try:
+        zpath = os.path.join(tmp, f"self-full-{uid}-{datetime.datetime.now():%Y%m%d-%H%M}.zip")
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+            for name in ("settings.json", "session.txt", "api.json"):
+                p = upath(uid, name)
+                if os.path.isfile(p):
+                    z.write(p, name)
+            z.writestr("README.txt", "بکاپ کامل سلف هاب\nبرگردوندن: همین زیپ رو با کپشن /restore بفرست.\n⚠️ حاوی سشن ورود تلگرامه؛ به هیچ‌کس نده و بعد از بازیابی از چت پاکش کن.")
+        with open(zpath, "rb") as f:
+            raw = f.read()
+        await bot.upload("sendDocument", {"chat_id": chat,
+                          "caption": "💾 <b>بکاپ کامل</b> (تنظیمات + سشن).\n⚠️ مثل رمزت ازش مراقبت کن؛ بعد از دانلود از چت پاکش کن.\nبرگردوندن: همین فایل رو با کپشن /restore بفرست."},
+                         "document", os.path.basename(zpath), raw)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def cmd_dump(bot, uid, chat, arg):
+    """ادمین: بکاپ کامل همه‌ی کاربرها (users.json + بکاپ امن همه، بدون سشن)."""
+    tmp = tempfile.mkdtemp(prefix="hubdump_")
+    try:
+        zpath = os.path.join(tmp, f"hub-dump-{datetime.datetime.now():%Y%m%d-%H%M}.zip")
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+            reg_p = os.path.join(DATA, "users.json")
+            if os.path.isfile(reg_p):
+                z.write(reg_p, "users.json")
+            for name in sorted(os.listdir(DATA)):
+                if not name.isdigit():
+                    continue
+                for fn in ("settings.json", "api.json"):
+                    p = os.path.join(DATA, name, fn)
+                    if os.path.isfile(p):
+                        if fn == "settings.json":
+                            try:
+                                d = read_json(p, {})
+                                cfg = {k: v for k, v in (d.get("cfg") or {}).items() if k not in ("bot_token", "proxy")}
+                                z.writestr(f"{name}/{fn}", json.dumps({"features": d.get("features") or {}, "cfg": cfg}, ensure_ascii=False, indent=1))
+                                continue
+                            except Exception:  # noqa
+                                pass
+                        z.write(p, f"{name}/{fn}")
+                lb = latest_backup(int(name)) if name.isdigit() else None
+                if lb and os.path.isfile(lb):
+                    z.write(lb, f"{name}/auto-backup.json")
+        with open(zpath, "rb") as f:
+            raw = f.read()
+        await bot.upload("sendDocument", {"chat_id": chat, "caption": f"💾 بکاپ کل هاب (بدون سشن‌ها، {len(raw)//1024}KB). بازیابی هر کاربر جدا با /restore انجام می‌شه."},
+                         "document", os.path.basename(zpath), raw)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def cmd_deploy(bot, uid, chat, arg):
+    kb = None
+    url = app_base_url()
+    if url:
+        kb = {"inline_keyboard": [[{"text": "📱 باز کردن مینی‌اپ", "web_app": {"url": url}}]]}
+    await bot.send(chat, DEPLOY_TEXT, kb)
+
+
+async def cmd_app(bot, uid, chat, arg):
+    url = app_base_url()
+    app_line = f"👇 بازش کن:\n{html.escape(url)}" if url else "⚠️ ادمین هنوز <code>HUB_DOMAIN</code> رو ست نکرده؛ فعلاً از /panel استفاده کن."
+    kb = {"inline_keyboard": [[{"text": "📱 باز کردن مینی‌اپ", "web_app": {"url": url}}]]} if url else None
+    text = MINIAPP_HELP.format(app_line=app_line, app_url=html.escape(url or "https://YOUR-DOMAIN.up.railway.app/app"))
+    await bot.send(chat, text, kb)
 
 
 async def cmd_restore(bot, uid, chat, arg):
@@ -994,20 +1158,82 @@ async def cmd_restore(bot, uid, chat, arg):
         if not p:
             return await bot.send(chat, "❌ بکاپ خودکاری برات ثبت نشده")
         return await bot.send(chat, "✅ " + await do_restore(uid, read_json(p, None)))
-    await bot.send(chat, "برای برگردوندن: فایل پشتیبان (.json) رو با کپشن <code>/restore</code> بفرست، یا <code>/restore last</code> برای آخرین بکاپ خودکار.")
+    await bot.send(chat, "برای برگردوندن: فایل پشتیبان (.json یا زیپ بکاپ کامل) رو با کپشن <code>/restore</code> بفرست، یا <code>/restore last</code> برای آخرین بکاپ خودکار.")
+
+
+async def download_telegram_file(bot, file_id: str) -> bytes:
+    info = await bot.api("getFile", file_id=file_id)
+    async with bot.s.get(f"https://api.telegram.org/file/bot{TOKEN}/{info['file_path']}") as r:
+        return await r.read()
 
 
 async def restore_from_doc(bot, uid, chat, doc):
-    if doc.get("file_size", 0) > 2_000_000 or not str(doc.get("file_name", "")).lower().endswith(".json"):
-        return await bot.send(chat, "❌ فقط فایل .json کمتر از ۲ مگابایت")
-    info = await bot.api("getFile", file_id=doc["file_id"])
-    async with bot.s.get(f"https://api.telegram.org/file/bot{TOKEN}/{info['file_path']}") as r:
-        raw = await r.read()
+    fname = str(doc.get("file_name", "")).lower()
+    if doc.get("file_size", 0) > 5_000_000 or not (fname.endswith(".json") or fname.endswith(".zip")):
+        return await bot.send(chat, "❌ فقط فایل .json یا .zip بکاپ کامل (کمتر از ۵ مگابایت)")
+    raw = await download_telegram_file(bot, doc["file_id"])
+    # زیپ بکاپ کامل
+    if fname.endswith(".zip"):
+        try:
+            msg = await do_restore_zip(uid, raw)
+        except ValueError as e:
+            return await bot.send(chat, f"❌ فایل معتبر نیست: {html.escape(str(e))[:200]}")
+        return await bot.send(chat, "✅ " + msg + "\n🔄 سلف داره با تنظیمات جدید بالا میاد...")
     try:
         msg = await do_restore(uid, json.loads(raw.decode("utf-8")))
     except (ValueError, UnicodeDecodeError) as e:
         return await bot.send(chat, f"❌ فایل معتبر نیست: {html.escape(str(e))[:200]}")
     await bot.send(chat, "✅ " + msg)
+
+
+async def do_restore_zip(uid, raw: bytes) -> str:
+    """بازیابی از زیپ بکاپ کامل (settings.json حتماً، session.txt/api.json اگه باشن)."""
+    tmp = tempfile.mkdtemp(prefix="restore_")
+    try:
+        zpath = os.path.join(tmp, "up.zip")
+        with open(zpath, "wb") as f:
+            f.write(raw)
+        if not zipfile.is_zipfile(zpath):
+            raise ValueError("فایل زیپ معتبر نیست")
+        with zipfile.ZipFile(zpath) as z:
+            names = set(z.namelist())
+            if "settings.json" not in names:
+                raise ValueError("توی زیپ settings.json پیدا نشد")
+            try:
+                obj = json.loads(z.read("settings.json").decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                raise ValueError("settings.json داخل زیپ خرابه")
+            feats, cfg = validate_backup(obj)
+            inst = INSTANCES.get(uid)
+            was_running = bool(inst and inst.running)
+            if inst:
+                await inst.stop()
+            make_backup(uid)
+            write_json(upath(uid, "settings.json"), {"features": feats, "cfg": cfg})
+            restored = ["تنظیمات"]
+            if "session.txt" in names:
+                sess = z.read("session.txt").decode("utf-8", "ignore").strip()
+                if len(sess) > 50:
+                    with open(upath(uid, "session.txt"), "w") as f:
+                        f.write(sess)
+                    restored.append("سشن")
+            if "api.json" in names:
+                try:
+                    api_obj = json.loads(z.read("api.json").decode("utf-8"))
+                    if api_obj.get("id") and api_obj.get("hash"):
+                        write_json(upath(uid, "api.json"), {"id": int(api_obj["id"]), "hash": str(api_obj["hash"])})
+                        restored.append("API")
+                except (ValueError, KeyError):
+                    pass
+            try:
+                os.remove(stopped_marker(uid))
+            except OSError:
+                pass
+            if (was_running or has_session(uid)) and is_allowed(uid):
+                get_instance(uid).start()
+            return f"بازیابی کامل انجام شد ({' + '.join(restored)}: {len(feats)} قابلیت)"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 async def do_update(bot, uid, chat, doc):
@@ -1284,9 +1510,50 @@ async def qr_wait(bot, uid):
 
 
 USER_CMDS = {"/panel": cmd_panel, "/status": cmd_status, "/cmd": cmd_cmd, "/restart": cmd_restart, "/stop": cmd_stop,
-             "/run": cmd_run, "/disconnect": cmd_disconnect, "/cancel": cmd_cancel, "/backup": cmd_backup, "/restore": cmd_restore}
+             "/run": cmd_run, "/disconnect": cmd_disconnect, "/cancel": cmd_cancel, "/backup": cmd_backup,
+             "/backup_full": cmd_backup_full, "/restore": cmd_restore, "/deploy": cmd_deploy, "/app": cmd_app,
+             "/miniapp": cmd_app}
 ADMIN_CMDS = {"/users": cmd_users, "/allow": cmd_allow, "/extend": cmd_extend, "/revoke": cmd_revoke, "/log": cmd_log,
-              "/broadcast": cmd_broadcast}
+              "/broadcast": cmd_broadcast, "/dump": cmd_dump}
+
+
+async def handle_manage(bot, uid, cid, mid, qid, action):
+    """دکمه‌های مدیریتی mg:* روی پنل."""
+    if action == "status":
+        await bot.answer(qid)
+        return await bot.edit(cid, mid, status_text(uid), {"inline_keyboard": [
+            [botpanel.btn("🔙 بازگشت به پنل", "m", "primary")]]})
+    if action == "run":
+        await bot.answer(qid, "در حال روشن کردن...")
+        await cmd_run(bot, uid, cid, "")
+        return await bot.edit(cid, mid, main_text(uid), main_keyboard(uid))
+    if action == "stop":
+        await bot.answer(qid, "خاموش شد")
+        await cmd_stop(bot, uid, cid, "")
+        return await bot.edit(cid, mid, main_text(uid), main_keyboard(uid))
+    if action == "restart":
+        await bot.answer(qid, "در حال ریستارت...")
+        await cmd_restart(bot, uid, cid, "")
+        return await bot.edit(cid, mid, main_text(uid), main_keyboard(uid))
+    if action == "backup":
+        await bot.answer(qid)
+        await cmd_backup(bot, uid, cid, "")
+        return
+    if action == "restore_last":
+        await bot.answer(qid)
+        p = latest_backup(uid)
+        if not p:
+            return await bot.send(cid, "❌ بکاپ خودکاری برات ثبت نشده. با /backup اول یکی بساز.")
+        await bot.send(cid, "✅ " + await do_restore(uid, read_json(p, None)))
+        return
+    if action == "deploy":
+        await bot.answer(qid)
+        return await bot.edit(cid, mid, DEPLOY_TEXT, {"inline_keyboard": [
+            [botpanel.btn("🔙 بازگشت به پنل", "m", "primary")]]})
+    if action == "app":
+        await bot.answer(qid)
+        return await cmd_app(bot, uid, cid, "")
+    await bot.answer(qid)
 
 
 async def request_access(bot, msg):
@@ -1319,8 +1586,7 @@ async def on_message(bot, msg):
     if uid == ADMIN and msg.get("document") and text.split("@")[0].lower().startswith("/update"):
         return await do_update(bot, uid, cid, msg["document"])
     if msg.get("document") and text.split("@")[0].lower().startswith("/restore"):
-        if not has_session(uid):
-            return await bot.send(cid, "🔌 اول /connect")
+        # بکاپ کامل زیپ حتی بدون سشن قبلی قبول می‌شه (سشن رو برمی‌گردونه)
         return await restore_from_doc(bot, uid, cid, msg["document"])
     if uid in LOGIN and not text.startswith("/"):
         return await handle_login(bot, msg)
@@ -1394,6 +1660,10 @@ async def on_callback(bot, q):
     if data == "x":
         await bot.answer(q["id"])
         return await bot.edit(cid, mid, "🔒 بسته شد. /panel برای باز کردن دوباره", {"inline_keyboard": []})
+    if kind == "mg":
+        if not has_session(uid):
+            return await bot.answer(q["id"], "اول /connect")
+        return await handle_manage(bot, uid, cid, mid, q["id"], rest)
     if not has_session(uid):
         return await bot.answer(q["id"], "اول /connect")
     if data == "m":
@@ -1415,11 +1685,289 @@ async def on_callback(bot, q):
     await bot.answer(q["id"])
 
 
+# ───────────── مینی‌اپ (Telegram WebApp) ─────────────
+# هر کاربر از داخل همین باتِ مشترک، بدون بات جدا، سلف خودش رو لمسی کنترل می‌کنه:
+# وضعیت، روشن/خاموش/ریستارت، همه‌ی قابلیت‌ها + بازی‌ها، اجرای دستور توی چت، بکاپ/بازیابی.
+# احراز هویت با initData تلگرام (HMAC با توکن بات) — جعل‌ناپذیر.
+def verify_init_data(init_data: str, max_age: int = 86400):
+    """(user_id, user_dict) یا (None, None) اگه امضا نامعتبر باشه."""
+    try:
+        params = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
+        recv_hash = params.pop("hash", "")
+        if not recv_hash or not TOKEN:
+            return None, None
+        data_check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+        secret = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, recv_hash):
+            return None, None
+        try:
+            auth_date = int(params.get("auth_date", "0"))
+            if auth_date and time.time() - auth_date > max_age:
+                return None, None
+        except ValueError:
+            return None, None
+        user = json.loads(params.get("user", "{}"))
+        uid = int(user.get("id", 0))
+        return (uid, user) if uid else (None, None)
+    except Exception:  # noqa
+        return None, None
+
+
+async def webapp_user(request):
+    try:
+        body = await request.json()
+    except Exception:  # noqa
+        return None, web.json_response({"ok": False, "error": "bad json"}, status=400)
+    uid, _ = verify_init_data(body.get("initData", ""))
+    if not uid:
+        return None, web.json_response({"ok": False, "error": "احراز هویت تلگرام نامعتبره؛ مینی‌اپ رو از داخل همین بات باز کن"}, status=401)
+    if not is_allowed(uid):
+        return None, web.json_response({"ok": False, "error": "دسترسی نداری؛ اول توی بات /start بزن تا ادمین تأییدت کنه"}, status=403)
+    return (uid, body), None
+
+
+def webapp_snapshot(uid) -> dict:
+    inst = INSTANCES.get(uid)
+    st = read_status(uid)
+    running = bool(inst and inst.running)
+    fresh = bool(st and time.time() - st.get("ts", 0) < 40)
+    flags = read_flags(uid)
+    feats = [{"key": k, "name": FEAT[k]["name"], "emoji": FEAT[k]["emoji"], "toggle": FEAT[k]["toggle"],
+              "on": bool(flags.get(k)), "desc": FEAT[k]["desc"]} for k in FEAT if k not in HIDDEN]
+    return {
+        "uid": uid,
+        "sub": sub_text(uid),
+        "has_session": has_session(uid),
+        "running": running,
+        "failed": bool(inst and inst.failed),
+        "uptime": int(time.time() - inst.started) if running else 0,
+        "ram": round(inst.rss() or 0) if running and inst.rss() else None,
+        "authorized": bool(st.get("authorized")) if fresh else None,
+        "loops": st.get("loops") if fresh else {},
+        "on_count": sum(1 for v in flags.values() if v),
+        "total": len(feats),
+        "feats": feats,
+    }
+
+
+async def api_me(request):
+    auth, err = await webapp_user(request)
+    if err:
+        return err
+    uid, _ = auth
+    if not has_session(uid):
+        return web.json_response({"ok": True, "connected": False, "sub": sub_text(uid),
+                                  "hint": "هنوز اکانت وصل نکردی؛ توی بات /connect بزن"})
+    d = webapp_snapshot(uid)
+    d.update(ok=True, connected=True)
+    return web.json_response(d)
+
+
+async def api_toggle(request):
+    auth, err = await webapp_user(request)
+    if err:
+        return err
+    uid, body = auth
+    key, val = body.get("key", ""), bool(body.get("value"))
+    if not set_flag(uid, key, val):
+        return web.json_response({"ok": False, "error": "کلید نامعتبره"}, status=400)
+    return web.json_response({"ok": True, **webapp_snapshot(uid)})
+
+
+async def api_control(request):
+    auth, err = await webapp_user(request)
+    if err:
+        return err
+    uid, body = auth
+    act = str(body.get("action", "")).lower()
+    inst = get_instance(uid)
+    if act == "run":
+        if not has_session(uid):
+            return web.json_response({"ok": False, "error": "اول /connect"}, status=400)
+        if not is_allowed(uid):
+            return web.json_response({"ok": False, "error": "اشتراکت تموم شده"}, status=403)
+        try:
+            os.remove(stopped_marker(uid))
+        except OSError:
+            pass
+        inst.start()
+        return web.json_response({"ok": True, "msg": "🟢 سلف داره بالا میاد...", **webapp_snapshot(uid)})
+    if act == "stop":
+        await inst.stop()
+        try:
+            open(stopped_marker(uid), "w").close()
+        except OSError:
+            pass
+        return web.json_response({"ok": True, "msg": "🔴 سلف متوقف شد", **webapp_snapshot(uid)})
+    if act == "restart":
+        if not has_session(uid):
+            return web.json_response({"ok": False, "error": "اول /connect"}, status=400)
+        await inst.stop()
+        try:
+            os.remove(stopped_marker(uid))
+        except OSError:
+            pass
+        inst.start()
+        return web.json_response({"ok": True, "msg": "🔄 داره ریستارت می‌شه...", **webapp_snapshot(uid)})
+    return web.json_response({"ok": False, "error": "action نامعتبره"}, status=400)
+
+
+async def api_cmd(request):
+    auth, err = await webapp_user(request)
+    if err:
+        return err
+    uid, body = auth
+    target = str(body.get("target", "me")).strip() or "me"
+    text = str(body.get("text", "")).strip()[:500]
+    if not text:
+        return web.json_response({"ok": False, "error": "دستور خالیه"}, status=400)
+    inst = INSTANCES.get(uid)
+    if not (inst and inst.running):
+        return web.json_response({"ok": False, "error": "سلفت روشن نیست؛ اول روشنش کن"}, status=400)
+    if target.lower() != "me" and not (target.startswith("@") or target.lstrip("-").isdigit()):
+        return web.json_response({"ok": False, "error": "هدف باید me یا @username یا آیدی عددی باشه"}, status=400)
+    ctl_send(uid, op="run", chat=target, text=text)
+    return web.json_response({"ok": True, "msg": f"✅ به {target} فرستاده شد"})
+
+
+async def api_backup(request):
+    auth, err = await webapp_user(request)
+    if err:
+        return err
+    uid, _ = auth
+    data = sanitized_settings(uid)
+    if data is None:
+        return web.json_response({"ok": False, "error": "تنظیماتی نداری"}, status=400)
+    return web.json_response({"ok": True, "backup": data})
+
+
+async def api_restore(request):
+    auth, err = await webapp_user(request)
+    if err:
+        return err
+    uid, body = auth
+    obj = body.get("backup")
+    if not isinstance(obj, dict):
+        return web.json_response({"ok": False, "error": "فایل بکاپ نامعتبره"}, status=400)
+    try:
+        msg = await do_restore(uid, obj)
+    except ValueError as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+    return web.json_response({"ok": True, "msg": "✅ " + msg, **webapp_snapshot(uid)})
+
+
+MINIAPP_HTML = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<title>سلف · مینی‌اپ</title>
+<style>
+:root{--o1:#ff5a00;--o2:#ff8a1f;--bg:#0b0b0e;--card:#15151b;--line:#2b2015;--txt:#f4efe9;--mut:#9a8f84}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Vazirmatn,Tahoma,sans-serif;background:var(--bg);color:var(--txt);padding:14px 12px 40px}
+h1{font-size:18px;margin:4px 0 2px}.sub{color:var(--mut);font-size:12px;margin-bottom:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;margin:10px 0}
+.row{display:flex;gap:8px;flex-wrap:wrap}button{flex:1;min-width:100px;padding:11px;border-radius:11px;border:1px solid var(--line);background:#1e1e26;color:var(--txt);font-size:14px;font-weight:700;cursor:pointer}
+button.on{background:linear-gradient(135deg,var(--o2),var(--o1));color:#170a00;border:0}
+button.ghost{background:transparent}button:disabled{opacity:.5}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.f{display:flex;align-items:center;gap:8px;background:#101016;border:1px solid var(--line);border-radius:11px;padding:9px;font-size:13px;cursor:pointer}
+.f b{margin-right:auto;font-size:12px}.f.on{border-color:var(--o2)}.dot{width:9px;height:9px;border-radius:50%;background:#555}.f.on .dot{background:#2cff85}
+input,select,textarea{width:100%;padding:10px;margin:5px 0;border-radius:10px;border:1px solid var(--line);background:#0c0c10;color:var(--txt);font-size:14px;font-family:inherit}
+small{color:var(--mut);font-size:12px;line-height:1.8}.ok{color:#7dffb0}.err{color:#ff8d7d}
+.tabs{display:flex;gap:6px;margin:10px 0}.tabs button{font-size:13px;padding:9px}
+.hidden{display:none}.pill{font-size:11px;background:#22222c;border:1px solid var(--line);border-radius:99px;padding:3px 9px;color:var(--mut)}
+</style></head><body>
+<h1>🐾 سلف من <span class="pill" id="runpill">…</span></h1>
+<div class="sub" id="sub">در حال اتصال…</div>
+<div class="tabs">
+<button data-t="home" class="on">🏠 خانه</button><button data-t="feats">🎛 قابلیت‌ها</button><button data-t="game">🐱 بازی</button><button data-t="bak">💾 بکاپ</button>
+</div>
+<div id="t-home">
+<div class="card"><div id="status">…</div><div class="row" style="margin-top:10px">
+<button id="b-run">🟢 روشن</button><button id="b-stop">🔴 خاموش</button><button id="b-restart">🔄 ریستارت</button>
+</div><small>روشن/خاموش کردن سلف، ریستارت، وضعیت لحظه‌ای (رم، آپتایم، حلقه‌های بازی).</small></div>
+<div class="card"><b>⚡ اجرای سریع دستور</b><input id="q-target" value="me" dir="ltr" placeholder="me یا @group یا آیدی چت">
+<input id="q-text" placeholder="مثلاً .میویی یا .وضعیت چت">
+<button id="b-send" class="on">ارسال به سلف 🚀</button><div id="q-msg"></div>
+<small>دستورهای بازی (.میویی .ماهیگیری .یخچال .پیشی .خفاش .نجات) رو توی چت بازی بفرست. me = سیو مسج.</small></div>
+</div>
+<div id="t-feats" class="hidden"><div class="card"><b>🎛 قابلیت‌ها</b> <span class="pill" id="oncount"></span><div class="grid" id="feats" style="margin-top:8px"></div>
+<small>سبز = روشن. تغییر بلافاصله به سلف ارسال می‌شه.</small></div></div>
+<div id="t-game" class="hidden"><div class="card"><b>🐱 بازی میویی</b><input id="g-chat" value="me" dir="ltr" placeholder="آیدی/یوزرنیم چت بازی">
+<div class="grid" id="games" style="margin-top:8px"></div><div id="g-msg"></div>
+<small>هر دکمه، دستورش رو توی همون چت اجرا می‌کنه. وضعیت دقیق: <code>.وضعیت چت</code></small></div></div>
+<div id="t-bak" class="hidden"><div class="card"><b>💾 پشتیبان‌گیری / بازیابی</b><div class="row">
+<button id="b-dl">⬇️ دانلود بکاپ</button><button id="b-last">♻️ برگردوندن آخرین بکاپ سرور</button></div>
+<textarea id="b-json" rows="4" dir="ltr" placeholder="JSON بکاپ رو اینجا بذار برای بازیابی دستی"></textarea>
+<button id="b-up" class="on">♻️ بازیابی از همین متن</button><div id="b-msg"></div>
+<small>بکاپ تنظیماته (بدون سشن). بکاپ کامل زیپ (با سشن) رو از داخل بات با /backup_full بگیر.</small></div></div>
+<script>
+const tg=window.Telegram?.WebApp;tg?.expand();tg?.ready();
+const $=id=>document.getElementById(id);
+let INIT=tg?.initData||"";
+if(!INIT){$("sub").textContent="⚠️ مینی‌اپ رو از داخل بات تلگرام باز کن (دکمه‌ی 📱 مینی‌اپ).";}
+async function api(path,body={}){const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData:INIT,...body})});const j=await r.json();if(!r.ok)throw new Error(j.error||("خطا "+r.status));return j;}
+const GAMES=[[".میویی 🐱",".میویی"],[".ماهیگیری 🎣",".ماهیگیری"],[".یخچال 🧊",".یخچال"],[".پیشی 😺",".پیشی"],[".خفاش 🦇",".خفاش"],[".نجات 🐈",".نجات"],[".وضعیت چت 🩺",".وضعیت چت"],[".گزارش 📊",".گزارش"]];
+function fmtU(s){s=+s||0;const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+" روز ":"")+(h?h+" ساعت ":"")+m+" دقیقه";}
+async function load(){try{const d=await api("/api/me");if(!d.connected){$("sub").textContent="🔌 "+d.hint+" · "+d.sub;$("status").innerHTML="🔌 اکانت وصل نیست. توی بات /connect بزن.";return;}
+$("sub").textContent="🎫 "+d.sub;$("runpill").textContent=d.running?"🟢 روشن":"🔴 خاموش";
+$("status").innerHTML=(d.running?"🟢 <b>سلف روشنه</b>":"🔴 <b>سلف خاموشه</b>")+(d.uptime?` · ⏱ ${fmtU(d.uptime)}`:"")+(d.ram?` · 🧠 ${d.ram}MB`:"")+(d.loops&&Object.keys(d.loops).length?`<br>🔄 ${Object.entries(d.loops).map(([k,v])=>k+": "+v+" چت").join(" · ")}`:"");
+$("oncount").textContent=d.on_count+" از "+d.total+" روشن";
+const box=$("feats");box.innerHTML="";d.feats.forEach(f=>{const el=document.createElement("div");el.className="f"+(f.on&&f.toggle?" on":"");el.innerHTML=`<span class="dot"></span><span>${f.emoji} ${f.name}</span><b>${f.toggle?(f.on?"روشن":"خاموش"):"دستوری"}</b>`;if(f.toggle){el.onclick=async()=>{try{const n=await api("/api/toggle",{key:f.key,value:!f.on});load2(n);}catch(e){alert(e.message)}};}else{el.onclick=()=>alert(f.desc);}box.appendChild(el);});
+const g=$("games");if(!g.children.length){GAMES.forEach(([t,c])=>{const b=document.createElement("button");b.textContent=t;b.onclick=async()=>{try{const chat=$("g-chat").value.trim()||"me";await api("/api/cmd",{target:chat,text:c});$("g-msg").innerHTML="<span class='ok'>✅ فرستاده شد به "+chat+"</span>";}catch(e){$("g-msg").innerHTML="<span class='err'>❌ "+e.message+"</span>";}};g.appendChild(b);});}
+}catch(e){$("sub").textContent="❌ "+e.message;}}
+function load2(d){if(!d)return load();$("runpill").textContent=d.running?"🟢 روشن":"🔴 خاموش";$("oncount").textContent=d.on_count+" از "+d.total+" روشن";load();}
+document.querySelectorAll(".tabs button").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tabs button").forEach(x=>x.classList.remove("on"));b.classList.add("on");["home","feats","game","bak"].forEach(t=>$("t-"+t).classList.toggle("hidden",t!==b.dataset.t));tg?.HapticFeedback?.impactOccurred("light");});
+$("b-run").onclick=async()=>{try{const d=await api("/api/control",{action:"run"});alert(d.msg||"🟢");load();}catch(e){alert(e.message)}};
+$("b-stop").onclick=async()=>{try{const d=await api("/api/control",{action:"stop"});alert(d.msg||"🔴");load();}catch(e){alert(e.message)}};
+$("b-restart").onclick=async()=>{try{const d=await api("/api/control",{action:"restart"});alert(d.msg||"🔄");load();}catch(e){alert(e.message)}};
+$("b-send").onclick=async()=>{try{const d=await api("/api/cmd",{target:$("q-target").value.trim()||"me",text:$("q-text").value});$("q-msg").innerHTML="<span class='ok'>"+d.msg+"</span>";}catch(e){$("q-msg").innerHTML="<span class='err'>❌ "+e.message+"</span>";}};
+$("b-dl").onclick=async()=>{try{const d=await api("/api/backup");const blob=new Blob([JSON.stringify(d.backup,null,1)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="self-backup.json";a.click();}catch(e){alert(e.message)}};
+$("b-last").onclick=async()=>{try{const d=await api("/api/cmd",{target:"me",text:"/restore last"});$("b-msg").innerHTML="<span class='ok'>درخواست بازیابی آخر فرستاده شد؛ نتیجه توی بات میاد.</span>";}catch(e){$("b-msg").innerHTML="<span class='err'>❌ "+e.message+"</span>";}};
+$("b-up").onclick=async()=>{try{const obj=JSON.parse($("b-json").value);const d=await api("/api/restore",{backup:obj});$("b-msg").innerHTML="<span class='ok'>"+d.msg+"</span>";load();}catch(e){$("b-msg").innerHTML="<span class='err'>❌ "+e.message+"</span>";}};
+load();
+</script></body></html>"""
+
+
+async def serve_app(request):
+    return web.Response(text=MINIAPP_HTML, content_type="text/html")
+
+
 async def handle_update(bot, u):
     if "callback_query" in u:
         await on_callback(bot, u["callback_query"])
     elif "message" in u:
         await on_message(bot, u["message"])
+
+
+BOT_COMMANDS = [
+    {"command": "panel", "description": "🎛 پنل مدیریتی (روشن/خاموش، قابلیت‌ها، بکاپ)"},
+    {"command": "status", "description": "📊 وضعیت سلف"},
+    {"command": "app", "description": "📱 مینی‌اپ (کنترل لمسی)"},
+    {"command": "connect", "description": "🔌 وصل کردن اکانت"},
+    {"command": "deploy", "description": "🚀 آموزش دیپلوی روی Railway"},
+    {"command": "cmd", "description": "⚡ اجرای دستور (مثال: /cmd me .میویی)"},
+    {"command": "run", "description": "🟢 روشن کردن سلف"},
+    {"command": "stop", "description": "🔴 خاموش کردن سلف"},
+    {"command": "restart", "description": "🔄 ریستارت سلف"},
+    {"command": "backup", "description": "💾 بکاپ تنظیمات"},
+    {"command": "backup_full", "description": "💾 بکاپ کامل (با سشن)"},
+    {"command": "restore", "description": "♻️ بازیابی (/restore last)"},
+    {"command": "disconnect", "description": "🗑 خروج و حذف اطلاعات"},
+]
+
+
+async def setup_bot_menu(bot):
+    try:
+        await bot.api("setMyCommands", commands=BOT_COMMANDS)
+    except Exception as e:  # noqa
+        log.warning("setMyCommands failed: %r", e)
+    url = app_base_url()
+    if url:
+        try:
+            await bot.api("setChatMenuButton", menu_button={"type": "web_app", "text": "📱 مینی‌اپ", "web_app": {"url": url}})
+            log.info("menu button -> %s", url)
+        except Exception as e:  # noqa
+            log.warning("setChatMenuButton failed: %r (شاید بات هنوز WebApp نداره؛ توی BotFather /newapp بزن)", e)
 
 
 async def poll(app):
@@ -1431,6 +1979,7 @@ async def poll(app):
                 me = await bot.api("getMe")
                 await bot.api("deleteWebhook")
                 log.info("hub bot: @%s admin=%s", me.get("username"), ADMIN)
+                await setup_bot_menu(bot)
                 offset = None
                 while True:
                     await purge_logins()
@@ -1452,7 +2001,9 @@ async def poll(app):
 
 
 async def health(request):
-    return web.json_response({"hub": True, "running": sum(1 for i in INSTANCES.values() if i.running)})
+    return web.json_response({"hub": True, "single_bot": True,
+                              "running": sum(1 for i in INSTANCES.values() if i.running),
+                              "users": len(connected_users()), "app": bool(app_base_url())})
 
 
 async def on_startup(app):
@@ -1473,7 +2024,16 @@ def main():
     if not TOKEN or not ADMIN:
         raise SystemExit("HUB_BOT_TOKEN و HUB_ADMIN_ID لازمه")
     app = web.Application()
-    app.add_routes([web.get("/", health)])
+    app.add_routes([
+        web.get("/", health),
+        web.get("/app", serve_app),
+        web.post("/api/me", api_me),
+        web.post("/api/toggle", api_toggle),
+        web.post("/api/control", api_control),
+        web.post("/api/cmd", api_cmd),
+        web.post("/api/backup", api_backup),
+        web.post("/api/restore", api_restore),
+    ])
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
