@@ -75,7 +75,7 @@ async def smoke_test(stage: str):
     env.update(SELF_OVERLAY="1", PYTHONDONTWRITEBYTECODE="1")
     env.setdefault("PANEL_PASSWORD", "test")
     env["PYTHONPATH"] = boot.REPO_DIR
-    code = "import core, extras, botpanel, meow, features, updater, ctl, hub, main"
+    code = "import core, extras, botpanel, meow, features, updater, ctl, hub, railway, main"
     p = await asyncio.create_subprocess_exec(
         sys.executable, "-c", code, cwd=stage, env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -108,7 +108,7 @@ async def apply(path: str, filename: str, note=None):
             pack = extract(path, filename)
             files, skipped = pack["files"], pack["skipped"]
             if not files:
-                return False, "توی فایل هیچ کد مجازی پیدا نشد (main/core/features/meow/botpanel/updater/boot)"
+                return False, "توی فایل هیچ کد مجازی پیدا نشد (main/core/features/meow/botpanel/updater/boot/hub/railway)"
             syntax_check(files)
             stage = tempfile.mkdtemp(prefix="selfupd_")
             try:

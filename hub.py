@@ -713,6 +713,77 @@ ADMIN_HELP = (
     "/broadcast &lt;متن&gt; ← پیام به همه · /dump ← بکاپ کامل همه‌ی کاربرها (زیپ، ادمین)\n"
     "بروزرسانی: فایل زیپ رو با کپشن <code>/update</code> بفرست"
 )
+# ───────────── شروع عمومی: برای همه بالا میاد (بدون نیاز به تأیید) ─────────────
+# هیچ سلفی روی اکانت ادمین ساخته نمی‌شه؛ هر کس با توکن Railway خودش دیپلوی جدا می‌گیره.
+START_PUBLIC = (
+    "🐾 <b>ساخت سلف روی Railway خودت</b>\n\n"
+    "سلام! با همین بات برای خودت یه سلف جدا می‌سازی — <b>روی اکانت Railway خودت</b>، نه روی اکانت من.\n\n"
+    "🚀 <b>ساخت سلف:</b> توکن Railway رو می‌دی، از ریپوی <code>{repo}</code> برات پروژه ساخته و دیپلوی می‌شه "
+    "(سرویس + متغیرها + Volume روی /data + دامنه).\n"
+    "📱 بعدش سلف خودت پنل وب + مینی‌اپ + همه‌ی قابلیت‌ها (میویی، ماهیگیری، یخچال، پیشی، خفاش، نجات، بکاپ و...) رو داره.\n\n"
+    "👇 یه گزینه رو بزن:"
+)
+PUBLIC_HELP = (
+    "❓ <b>راهنما</b>\n\n"
+    "🚀 /deploy ← شروع ساخت سلف (توکن Railway خودت رو از railway.com/account/tokens بساز)\n"
+    "📊 /deploy_status ← وضعیت دیپلوی‌ت\n"
+    "🔄 /redeploy ← دیپلوی دوباره\n"
+    "🗑 /forget ← حذف توکن ذخیره‌شده\n\n"
+    "بعد از دیپلوی، دامنه‌ای که بات می‌ده رو باز کن، با رمزت وارد شو و شماره/کد تلگرام رو بزن. تمام ✅"
+)
+FEATURES_PUBLIC = (
+    "✨ <b>قابلیت‌های سلف تو (بعد از دیپلوی)</b>\n\n"
+    "🤖 سلف کامل روی اکانت خودت: پنل وب + مینی‌اپ\n"
+    "🐱 بازی میویی: میو، ماهیگیری، یخچال، پیشی، خفاش، نجات خودکار\n"
+    "🛡 مدیریت گروه: نگهبان، قفل‌ها، فیلتر، عضویت اجباری، سکوت\n"
+    "💾 پشتیبان‌گیری و بازیابی کامل\n"
+    "⏰ ساعت، تاریخ شمسی، منشی، پاسخ خودکار، آفلاین و...\n\n"
+    "برای ساختش /deploy بزن 🚀"
+)
+PUBLIC_CMDS = {"/deploy", "/deploy_status", "/redeploy", "/forget", "/cancel"}
+
+
+def public_start_kb() -> dict:
+    rows = [[botpanel.btn("🚀 ساخت سلف روی ریلوی", "dp:auto", "success")]]
+    w = deploy_web_url()
+    if w:
+        rows.append([{"text": "🌐 فرم وب دیپلوی", "web_app": {"url": w}}])
+    rows += [[botpanel.btn("📖 آموزش دستی", "dp:manual", "primary"),
+              botpanel.btn("📊 وضعیت دیپلوی", "dp:status", "primary")],
+             [botpanel.btn("✨ قابلیت‌ها", "st:features", "primary"),
+              botpanel.btn("❓ راهنما", "st:help", "primary")]]
+    return {"inline_keyboard": rows}
+
+
+async def send_public_start(bot, cid):
+    await bot.send(cid, START_PUBLIC.format(repo=html.escape(SELF_REPO)), public_start_kb())
+
+
+async def handle_public_cmd(bot, uid, cid, cmd, arg) -> bool:
+    """دستورهای عمومی (برای همه، بدون تأیید). True یعنی مصرف شد."""
+    if cmd == "/deploy":
+        await bot.send(cid, deploy_menu_text(deploy_web_url()), deploy_menu_kb(deploy_web_url() or None))
+        return True
+    if cmd == "/deploy_status":
+        await cmd_deploy_status(bot, uid, cid, arg)
+        return True
+    if cmd == "/redeploy":
+        await cmd_redeploy(bot, uid, cid, arg)
+        return True
+    if cmd == "/forget":
+        await cmd_forget(bot, uid, cid, arg)
+        return True
+    if cmd == "/cancel":
+        if uid in DEPLOY_STATE:
+            DEPLOY_STATE.pop(uid, None)
+            await bot.send(cid, "دیپلوی لغو شد. توکنی ذخیره نشد.")
+            return True
+        if uid in LOGIN:
+            await cleanup_login(uid)
+            await bot.send(cid, "لغو شد.")
+            return True
+        return False
+    return False
 CONSENT = (
     "⚠️ <b>قبل از وصل کردن اکانت بخون</b>\n\n"
     "• اکانتت روی سرور این هاب اجرا می‌شه و سشن ورودت اونجا ذخیره می‌شه؛ یعنی ادمین سرور از نظر فنی به اون دسترسی داره.\n"
@@ -1839,40 +1910,103 @@ async def on_message(bot, msg):
     if chat.get("type") != "private" or "from" not in msg:
         return
     uid, cid = msg["from"]["id"], chat["id"]
-    if not is_allowed(uid):
-        return await request_access(bot, msg)
     text = (msg.get("text") or msg.get("caption") or "").strip()
-    if uid == ADMIN and msg.get("document") and text.split("@")[0].lower().startswith("/update"):
-        return await do_update(bot, uid, cid, msg["document"])
-    if msg.get("document") and text.split("@")[0].lower().startswith("/restore"):
-        # بکاپ کامل زیپ حتی بدون سشن قبلی قبول می‌شه (سشن رو برمی‌گردونه)
-        return await restore_from_doc(bot, uid, cid, msg["document"])
-    if uid in LOGIN and not text.startswith("/"):
-        return await handle_login(bot, msg)
+    # قدم‌های دیپلوی (توکن/رمز/API) برای همه‌ست — قبل از هر گیتی، و پیام توکن پاک می‌شه
     if uid in DEPLOY_STATE and not text.startswith("/"):
         if await handle_deploy_step(bot, msg):
             return
+    if uid in LOGIN and not text.startswith("/") and is_allowed(uid):
+        return await handle_login(bot, msg)
     if not text.startswith("/"):
         return
     cmd, _, arg = text.partition(" ")
     cmd = cmd.split("@")[0].lower()
-    if cmd in ("/start", "/help"):
-        return await bot.send(cid, HELP + (ADMIN_HELP if uid == ADMIN else ""))
+    arg = arg.strip()
+    # /start و /help برای همه بالا میاد
+    if cmd == "/start":
+        if uid == ADMIN or is_allowed(uid):
+            await bot.send(cid, HELP + (ADMIN_HELP if uid == ADMIN else ""))
+        return await send_public_start(bot, cid)
+    if cmd == "/help":
+        if uid == ADMIN or is_allowed(uid):
+            return await bot.send(cid, HELP + (ADMIN_HELP if uid == ADMIN else ""))
+        return await bot.send(cid, PUBLIC_HELP, public_start_kb())
+    # دستورهای عمومی دیپلوی برای همه (بدون تأیید ادمین)
+    if cmd in PUBLIC_CMDS:
+        if await handle_public_cmd(bot, uid, cid, cmd, arg):
+            return
+    if uid == ADMIN and msg.get("document") and text.split("@")[0].lower().startswith("/update"):
+        return await do_update(bot, uid, cid, msg["document"])
+    # بقیه (هاست روی سرور ادمین) فقط برای تأییدشده‌ها؛ بقیه منوی عمومی می‌گیرن نه سکوت
+    if not is_allowed(uid):
+        return await send_public_start(bot, cid)
+    if msg.get("document") and text.split("@")[0].lower().startswith("/restore"):
+        # بکاپ کامل زیپ حتی بدون سشن قبلی قبول می‌شه (سشن رو برمی‌گردونه)
+        return await restore_from_doc(bot, uid, cid, msg["document"])
     if cmd == "/connect":
         return await begin_login(bot, uid, cid)
     if cmd in USER_CMDS:
-        return await USER_CMDS[cmd](bot, uid, cid, arg.strip())
+        return await USER_CMDS[cmd](bot, uid, cid, arg)
     if cmd in ADMIN_CMDS and uid == ADMIN:
-        return await ADMIN_CMDS[cmd](bot, uid, cid, arg.strip())
+        return await ADMIN_CMDS[cmd](bot, uid, arg)
 
 
 async def on_callback(bot, q):
     uid, data = q["from"]["id"], q.get("data", "")
     msg = q.get("message") or {}
     cid, mid = msg.get("chat", {}).get("id"), msg.get("message_id")
-    if not is_allowed(uid) and not (uid == ADMIN):
-        return await bot.answer(q["id"], "دسترسی نداری 🚫")
     kind, _, rest = data.partition(":")
+    # دکمه‌های عمومی (دیپلوی + شروع) برای همه — بدون نیاز به تأیید
+    if kind == "dp":
+        if rest == "auto":
+            await bot.answer(q["id"])
+            try:
+                await bot.edit(cid, mid, "🚀 شروع دیپلوی...")
+            except Exception:  # noqa
+                pass
+            return await start_deploy_flow(bot, uid, cid)
+        if rest == "manual":
+            await bot.answer(q["id"])
+            return await bot.edit(cid, mid, MANUAL_DEPLOY.format(repo=html.escape(SELF_REPO)),
+                                  {"inline_keyboard": [[botpanel.btn("🔙 بازگشت", "dp:back", "primary")]]})
+        if rest == "back":
+            await bot.answer(q["id"])
+            return await bot.edit(cid, mid, deploy_menu_text(deploy_web_url()), deploy_menu_kb(deploy_web_url() or None))
+        if rest == "confirm":
+            await bot.answer(q["id"], "شروع شد...")
+            return await confirm_deploy(bot, uid, cid)
+        if rest == "cancel":
+            DEPLOY_STATE.pop(uid, None)
+            await bot.answer(q["id"], "لغو شد")
+            return await bot.edit(cid, mid, "دیپلوی لغو شد. توکنی ذخیره نشد.")
+        if rest == "status":
+            await bot.answer(q["id"])
+            return await cmd_deploy_status(bot, uid, cid, "")
+        if rest == "redeploy":
+            await bot.answer(q["id"], "در حال ریدیپلوی...")
+            return await cmd_redeploy(bot, uid, cid, "")
+        if rest == "forget":
+            await bot.answer(q["id"], "پاک شد")
+            forget_deploy_token(uid)
+            return await bot.edit(cid, mid, "🗑 توکن پاک شد.", {"inline_keyboard": []})
+        await bot.answer(q["id"])
+        return
+    if kind == "st":
+        if rest == "features":
+            await bot.answer(q["id"])
+            return await bot.edit(cid, mid, FEATURES_PUBLIC,
+                                  {"inline_keyboard": [[botpanel.btn("🚀 ساخت سلف", "dp:auto", "success")],
+                                                       [botpanel.btn("🔙 بازگشت", "st:back", "primary")]]})
+        if rest == "help":
+            await bot.answer(q["id"])
+            return await bot.edit(cid, mid, PUBLIC_HELP, public_start_kb())
+        if rest == "back":
+            await bot.answer(q["id"])
+            return await bot.edit(cid, mid, START_PUBLIC.format(repo=html.escape(SELF_REPO)), public_start_kb())
+        await bot.answer(q["id"])
+        return
+    if not is_allowed(uid) and not (uid == ADMIN):
+        return await bot.answer(q["id"], "برای این بخش باید سلف خودت رو اول دیپلوی کنی 🚀", )
     if kind in ("ok", "no") and uid == ADMIN and rest.split(":")[0].isdigit():
         parts = rest.split(":")
         target = int(parts[0])
@@ -1921,38 +2055,7 @@ async def on_callback(bot, q):
         return await bot.edit(cid, mid, "🗑 اکانتت قطع شد و اطلاعاتت پاک شد. هر وقت خواستی /connect")
     if data == "x":
         await bot.answer(q["id"])
-        return await bot.edit(cid, mid, "🔒 بسته شد. /panel برای باز کردن دوباره", {"inline_keyboard": []})
-    if kind == "dp":
-        if rest == "auto":
-            await bot.answer(q["id"])
-            await bot.edit(cid, mid, "🚀 شروع دیپلوی...")
-            return await start_deploy_flow(bot, uid, cid)
-        if rest == "manual":
-            await bot.answer(q["id"])
-            return await bot.edit(cid, mid, MANUAL_DEPLOY.format(repo=html.escape(SELF_REPO)),
-                                  {"inline_keyboard": [[botpanel.btn("🔙 بازگشت", "dp:back", "primary")]]})
-        if rest == "back":
-            await bot.answer(q["id"])
-            return await bot.edit(cid, mid, deploy_menu_text(deploy_web_url()), deploy_menu_kb(deploy_web_url() or None))
-        if rest == "confirm":
-            await bot.answer(q["id"], "شروع شد...")
-            return await confirm_deploy(bot, uid, cid)
-        if rest == "cancel":
-            DEPLOY_STATE.pop(uid, None)
-            await bot.answer(q["id"], "لغو شد")
-            return await bot.edit(cid, mid, "دیپلوی لغو شد. توکنی ذخیره نشد.")
-        if rest == "status":
-            await bot.answer(q["id"])
-            return await cmd_deploy_status(bot, uid, cid, "")
-        if rest == "redeploy":
-            await bot.answer(q["id"], "در حال ریدیپلوی...")
-            return await cmd_redeploy(bot, uid, cid, "")
-        if rest == "forget":
-            await bot.answer(q["id"], "پاک شد")
-            forget_deploy_token(uid)
-            return await bot.edit(cid, mid, "🗑 توکن پاک شد.", {"inline_keyboard": []})
-        await bot.answer(q["id"])
-        return
+        return await bot.edit(cid, mid, "🔒 بسته شد. /start برای باز کردن دوباره", {"inline_keyboard": []})
     if kind == "mg":
         if not has_session(uid):
             return await bot.answer(q["id"], "اول /connect")
