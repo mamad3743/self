@@ -49,18 +49,40 @@ def feat_style(f) -> str:
     return "success" if F[f["key"]] else "danger"
 
 
+def _uptime() -> str:
+    try:
+        s = int(__import__("time").time() - core.START_TIME)
+    except Exception:  # noqa
+        return ""
+    d, r = divmod(s, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    parts = []
+    if d:
+        parts.append(f"{d} روز")
+    if h:
+        parts.append(f"{h} ساعت")
+    parts.append(f"{m} دقیقه")
+    return " و ".join(parts)
+
+
 def main_text() -> str:
     on = sum(1 for v in F.values() if v)
+    up = _uptime()
+    clk = "🕐 ساعت روشن" if F.get("clock") else "🕐 ساعت خاموش"
+    dt = "📅 تاریخ روشن" if F.get("date") else "📅 تاریخ خاموش"
     return (
-        "⚙️ <b>پنل مدیریت سلف</b>\n"
-        f"✔ {len(FEATS)} قابلیت آماده استفاده! ({on} روشن)\n"
-        "🟢 روشن   🔴 خاموش   🔵 دستوری\n\n"
-        "روی هر دکمه بزن تا راهنما و نمونه دستور رو ببینی."
+        "🔥 <b>پنل مدیریت سلف</b>\n"
+        f"🤖 ⏱ {up} · 🎛 <b>{on}</b> از {len(FEATS)} روشن\n"
+        f"{clk} · {dt}\n"
+        "🟢 روشن · 🔴 خاموش · 🔵 دستوری\n\n"
+        "👇 دکمه‌ی هر قابلیت = راهنما + نمونه دستور + روشن/خاموش"
     )
 
 
 def main_keyboard() -> dict:
-    rows = []
+    rows = [[btn("📊 وضعیت سلف", "f:status", "primary"), btn("💾 پشتیبان", "f:backup", "primary"),
+             btn("🐱 بازی", "f:automeow", "primary")]]
     for row in GRID:
         btns = [
             btn(f"{FEAT[k]['emoji']} {FEAT[k]['name']}", f"f:{k}", feat_style(FEAT[k]))
@@ -73,11 +95,19 @@ def main_keyboard() -> dict:
 
 def feat_text(key) -> str:
     f = FEAT[key]
-    status = ("🟢 روشن" if F[key] else "🔴 خاموش") if f["toggle"] else "🔵 دستوری"
+    on = sum(1 for v in F.values() if v)
+    if f["toggle"]:
+        status = ("🟢 <b>روشنه</b> — با دکمه‌ی زیر خاموشش کن" if F[key]
+                  else "🔴 <b>خاموشه</b> — با دکمه‌ی زیر روشنش کن")
+    else:
+        status = "🔵 دستوری — با دستور اجراش کن"
     ex = "\n".join(f"<code>{html.escape(e)}</code>" for e in f["examples"])
     return (
         f"{f['emoji']} <b>{html.escape(f['name'])}</b>\n"
-        f"وضعیت: {status}\n\n{html.escape(f['desc'])}\n\n<b>نمونه:</b>\n{ex}"
+        f"{status}\n"
+        f"🎛 {on} قابلیت روشنه\n\n"
+        f"📖 {html.escape(f['desc'])}\n\n"
+        f"⌨️ <b>نمونه دستور:</b>\n{ex}"
     )
 
 

@@ -434,10 +434,12 @@ def toggle_keys():
 
 
 def panel_text() -> str:
-    lines = ["⚙️ پنل متنی", ""]
+    on = sum(1 for v in F.values() if v)
+    lines = [f"🔥 پنل مدیریت سلف (🎛 {on} روشن)", ""]
     for i, k in enumerate(toggle_keys(), 1):
-        lines.append(f"{i}. {'✅' if F[k] else '❌'} {FEAT[k]['emoji']} {FEAT[k]['name']}")
-    lines += ["", "روشن/خاموش: .پنل شماره   (مثلاً .پنل 2)", "همه خاموش: .پنل off", "راهنما: .راهنما"]
+        lines.append(f"{i}. {'🟢' if F[k] else '🔴'} {FEAT[k]['emoji']} {FEAT[k]['name']}")
+    lines += ["", "⌨️ روشن/خاموش: .پنل شماره   (مثلاً .پنل 2)", "همه خاموش: .پنل off",
+              "📖 راهنما: .راهنما · 🎛 پنل دکمه‌ای: .پنل"]
     return "\n".join(lines)
 
 
