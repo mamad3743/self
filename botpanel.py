@@ -10,6 +10,7 @@ import asyncio
 import aiohttp
 
 import core
+import miniapp
 from core import F, CFG, FEATS, FEAT, GRID, state, save_settings, log
 
 BOT = {"username": None, "running": False}
@@ -80,9 +81,24 @@ def main_text() -> str:
     )
 
 
+def app_row():
+    """دکمه‌ی باز کردن مینی‌اپ (همون مینی‌اپ مدیریتی) بالای پنل — اگه دامنه ست باشه."""
+    try:
+        u = miniapp.app_url()
+    except Exception:  # noqa
+        u = ""
+    if not u:
+        return None
+    return [{"text": "📱 باز کردن مینی‌اپ", "web_app": {"url": u}}]
+
+
 def main_keyboard() -> dict:
-    rows = [[btn("📊 وضعیت سلف", "f:status", "primary"), btn("💾 پشتیبان", "f:backup", "primary"),
-             btn("🐱 بازی", "f:automeow", "primary")]]
+    rows = []
+    r = app_row()
+    if r:
+        rows.append(r)
+    rows.append([btn("📊 وضعیت سلف", "f:status", "primary"), btn("💾 پشتیبان", "f:backup", "primary"),
+                 btn("🐱 بازی", "f:automeow", "primary")])
     for row in GRID:
         btns = [
             btn(f"{FEAT[k]['emoji']} {FEAT[k]['name']}", f"f:{k}", feat_style(FEAT[k]))

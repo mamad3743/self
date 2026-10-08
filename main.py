@@ -8,6 +8,7 @@ if __name__ == "__main__" and os.environ.get("HUB_BOT_TOKEN"):
     raise SystemExit(0)
 import hmac
 import html
+import time
 import asyncio
 
 from aiohttp import web
@@ -26,6 +27,7 @@ import botpanel
 import meow
 import updater
 import ctl
+import miniapp
 from core import F, CFG, FEATS, FONTS, state, log, save_settings, save_api, save_session
 
 TEMPLATE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
@@ -418,6 +420,196 @@ async def logout(request):
     raise web.HTTPFound("/")
 
 
+# ───────────── مینی‌اپ تک‌سلف (همون مینی‌اپ هاب، با همین بک‌اند) ─────────────
+# احراز: کوکی پنل وب (مثل بقیه‌ی پنل) یا initData تلگرام (با توکن بات خودت).
+# با .پنل توی هر چتی دکمه‌ی باز کردنش میاد.
+_ME_CACHE = {"t": 0.0, "me": None}
+
+
+def mini_authed(request) -> bool:
+    try:
+        return hmac.compare_digest(request.cookies.get("auth", "").encode(), core.TOKEN.encode())
+    except Exception:  # noqa
+        return False
+
+
+async def mini_body(request):
+    """بادی درخواست اگه احراز باشه، وگرنه None (کوکی یا initData)."""
+    if mini_authed(request):
+        try:
+            return await request.json()
+        except Exception:  # noqa
+            return {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa
+        return None
+    if not isinstance(body, dict):
+        return None
+    tok = (CFG.get("bot_token") or "").strip()
+    uid = miniapp.verify(body.get("initData", ""), tok) if tok else None
+    if uid and state.get("me") and uid == state.get("me"):
+        return body
+    return None
+
+
+def mini_need_auth():
+    return web.json_response(
+        {"ok": False, "error": "وارد نشدی؛ اول از پنل وب همین دامنه وارد شو یا مینی‌اپ رو از دکمه‌ی بات باز کن"},
+        status=401)
+
+
+async def mini_me_cached():
+    if time.time() - _ME_CACHE["t"] < 120 and _ME_CACHE["me"] is not None:
+        return _ME_CACHE["me"]
+    try:
+        me = await core.client.get_me()
+    except Exception:  # noqa
+        return None
+    _ME_CACHE.update(t=time.time(), me=me)
+    return me
+
+
+async def single_snapshot():
+    me = await mini_me_cached() if state.get("authorized") else None
+    loops = {}
+    try:
+        for kind, cid in meow.TASKS:
+            loops[kind] = loops.get(kind, 0) + 1
+    except Exception:  # noqa
+        pass
+    feats = [{"key": f["key"], "name": f["name"], "emoji": f["emoji"], "toggle": f["toggle"],
+              "on": bool(F.get(f["key"])), "desc": f["desc"]} for f in FEATS]
+    on = sum(1 for f in feats if f["toggle"] and f["on"])
+    mem = None
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    mem = round(int(line.split()[1]) / 1024)
+                    break
+    except OSError:
+        pass
+    pend = 0
+    try:
+        now = time.time()
+        nxt = (meow.M().get("next") or {})
+        pend = sum(1 for v in nxt.values() if isinstance(v, (int, float)) and v > now)
+    except Exception:  # noqa
+        pass
+    account = None
+    if me is not None:
+        nm = " ".join(x for x in [getattr(me, "first_name", None), getattr(me, "last_name", None)] if x)
+        account = {"name": nm or getattr(me, "username", None) or "—",
+                   "username": getattr(me, "username", None), "id": getattr(me, "id", None)}
+    return {"ok": True, "connected": bool(state.get("authorized")), "mode": "single",
+            "caps": {"run_stop": False, "restore_last": False},
+            "me": account, "sub": None, "domain": "",
+            "running": bool(state.get("authorized")), "failed": False,
+            "uptime": int(time.time() - core.START_TIME) if state.get("authorized") else 0,
+            "ram": mem, "restarts": CFG.get("restarts", 0), "pending": pend,
+            "authorized": bool(state.get("authorized")), "loops": loops,
+            "on_count": on, "total": len(feats), "feats": feats}
+
+
+async def mini_app_page(request):
+    return web.Response(text=miniapp.HTML, content_type="text/html")
+
+
+async def mini_api_me(request):
+    if await mini_body(request) is None:
+        return mini_need_auth()
+    if not state.get("authorized"):
+        return web.json_response({"ok": True, "connected": False, "mode": "single",
+                                  "hint": "هنوز وارد تلگرام نشدی؛ اول از پنل وب همین دامنه وارد شو",
+                                  "sub": None, "caps": {"run_stop": False, "restore_last": False},
+                                  "me": None})
+    return web.json_response(await single_snapshot())
+
+
+async def mini_api_toggle(request):
+    body = await mini_body(request)
+    if body is None:
+        return mini_need_auth()
+    key = (body.get("key") or "")
+    if key not in F:
+        return web.json_response({"ok": False, "error": "کلید نامعتبره"}, status=400)
+    await ctl.handle({"op": "toggle", "key": key, "value": bool(body.get("value"))})
+    return web.json_response(await single_snapshot())
+
+
+async def mini_api_control(request):
+    body = await mini_body(request)
+    if body is None:
+        return mini_need_auth()
+    act = str(body.get("action", "")).lower()
+    if act == "restart":
+        async def _late():
+            await asyncio.sleep(2)
+            updater.restart()
+        asyncio.create_task(_late())
+        d = await single_snapshot()
+        d["msg"] = "🔄 سلف داره ریستارت می‌شه؛ چند ثانیه بعد رفرش کن"
+        return web.json_response(d)
+    if act == "run":
+        d = await single_snapshot()
+        d["msg"] = "🟢 تک‌سلف همیشه روشنه"
+        return web.json_response(d)
+    return web.json_response({"ok": False, "error": "توقف سلف از مینی‌اپ ممکن نیست"}, status=400)
+
+
+async def mini_api_cmd(request):
+    body = await mini_body(request)
+    if body is None:
+        return mini_need_auth()
+    target = str(body.get("target", "me")).strip() or "me"
+    text = str(body.get("text", "")).strip()[:500]
+    if not text:
+        return web.json_response({"ok": False, "error": "دستور خالیه"}, status=400)
+    if target.lower() != "me" and not (target.startswith("@") or target.lstrip("-").isdigit()):
+        return web.json_response({"ok": False, "error": "هدف باید me یا @username یا آیدی عددی باشه"}, status=400)
+    if not (state.get("authorized") and core.client):
+        return web.json_response({"ok": False, "error": "سلف وارد نشده"}, status=400)
+    await ctl.handle({"op": "run", "chat": target, "text": text})
+    return web.json_response({"ok": True, "msg": f"✅ به {target} فرستاده شد"})
+
+
+def mini_sanitized():
+    cfg = {k: v for k, v in CFG.items() if k not in ("bot_token", "proxy")}
+    return {"features": {k: bool(v) for k, v in F.items()}, "cfg": cfg}
+
+
+async def mini_api_backup(request):
+    if await mini_body(request) is None:
+        return mini_need_auth()
+    return web.json_response({"ok": True, "backup": mini_sanitized()})
+
+
+async def mini_api_restore(request):
+    body = await mini_body(request)
+    if body is None:
+        return mini_need_auth()
+    obj = (body or {}).get("backup")
+    if not isinstance(obj, dict) or not isinstance(obj.get("features"), dict) or not isinstance(obj.get("cfg"), dict):
+        return web.json_response({"ok": False, "error": "ساختار بکاپ درست نیست"}, status=400)
+    feats = {k: bool(v) for k, v in obj["features"].items() if k in F}
+    cfg = {k: v for k, v in obj["cfg"].items() if k in CFG and k not in ("bot_token", "proxy")}
+    F.update(feats)
+    CFG.update(cfg)
+    save_settings()
+    try:
+        await features.refresh()
+    except Exception:  # noqa
+        pass
+    try:
+        await meow.ensure()
+    except Exception:  # noqa
+        pass
+    d = await single_snapshot()
+    d["msg"] = f"✅ {len(feats)} قابلیت و {len(cfg)} تنظیم برگشت"
+    return web.json_response(d)
+
+
 async def on_startup(app):
     core.load_api()
     core.load_settings()
@@ -464,6 +656,13 @@ def main():
         web.post("/2fa", send_2fa),
         web.post("/settings", settings),
         web.post("/logout", logout),
+        web.get("/app", mini_app_page),
+        web.post("/api/me", mini_api_me),
+        web.post("/api/toggle", mini_api_toggle),
+        web.post("/api/control", mini_api_control),
+        web.post("/api/cmd", mini_api_cmd),
+        web.post("/api/backup", mini_api_backup),
+        web.post("/api/restore", mini_api_restore),
     ])
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)

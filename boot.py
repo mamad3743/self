@@ -15,7 +15,7 @@ REPO_DIR = os.environ.setdefault("SELF_REPO_DIR", os.path.dirname(os.path.abspat
 CODE_DIR = os.getenv("CODE_DIR", "/data/code")
 STATE = CODE_DIR.rstrip("/") + ".state"
 NOTE = os.getenv("UPDATE_NOTE_FILE", "/data/update_note.json")
-CODE_FILES = ("main.py", "core.py", "features.py", "meow.py", "botpanel.py", "updater.py", "boot.py", "ctl.py", "hub.py", "extras.py", "railway.py")
+CODE_FILES = ("main.py", "core.py", "features.py", "meow.py", "botpanel.py", "updater.py", "boot.py", "ctl.py", "hub.py", "extras.py", "railway.py", "miniapp.py")
 MAX_TRIES = 2
 
 

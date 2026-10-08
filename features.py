@@ -17,7 +17,7 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 
 import aiohttp
-from telethon import TelegramClient, events, utils
+from telethon import TelegramClient, events, utils, Button
 from telethon.sessions import StringSession
 from telethon.tl import types
 from telethon.errors import FloodWaitError, UserNotParticipantError
@@ -32,6 +32,7 @@ import meow
 import updater
 import ctl
 import extras
+import miniapp
 from core import (
     F, CFG, FEATS, FEAT, state, log, TZ, save_settings, digits,
     jalali_short, jalali_long, clock_text, strip_clock, strip_bio, profile_key,
@@ -439,8 +440,56 @@ def panel_text() -> str:
     for i, k in enumerate(toggle_keys(), 1):
         lines.append(f"{i}. {'🟢' if F[k] else '🔴'} {FEAT[k]['emoji']} {FEAT[k]['name']}")
     lines += ["", "⌨️ روشن/خاموش: .پنل شماره   (مثلاً .پنل 2)", "همه خاموش: .پنل off",
+              "📱 مینی‌اپ (هر چتی): .پنل مینی‌اپ",
               "📖 راهنما: .راهنما · 🎛 پنل دکمه‌ای: .پنل"]
     return "\n".join(lines)
+
+
+async def self_mini_header() -> str:
+    """هدر مدیریتی خفن: اسم اکانت + تایم سلف + شمارش — برای پیام مینی‌اپ."""
+    try:
+        me = await C().get_me()
+    except Exception:  # noqa
+        me = None
+    on = sum(1 for v in F.values() if v)
+    s = int(time.time() - core.START_TIME)
+    d, r = divmod(s, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    up = " و ".join(x for x in ((f"{d} روز" if d else ""), (f"{h} ساعت" if h else ""), f"{m} دقیقه") if x)
+    try:
+        loops = len(meow.TASKS)
+    except Exception:  # noqa
+        loops = 0
+    if me is not None:
+        nm, un, uid = dname(me), getattr(me, "username", None), getattr(me, "id", None)
+        acc = f"👤 <b>{nm}</b>" + (f" (@{un} · <code>{uid}</code>)" if un else (f" (<code>{uid}</code>)" if uid else ""))
+    else:
+        acc = "👤 —"
+    return (f"🔥 <b>مدیریت سلف</b>\n{acc}\n⏱ آپتایم سلف: {up} · 🎛 <b>{on}</b> روشن"
+            + (f" · 🔄 {loops} حلقه‌ی بازی" if loops else ""))
+
+
+async def c_panel_app(event):
+    """پست لینک مینی‌اپ توی همین چت — هرجا .پنل مینی‌اپ بزنی میاد."""
+    url, web = miniapp.app_url(), miniapp.web_url()
+    header = await self_mini_header()
+    if not url:
+        return await safe_edit(event, header + "\n\n⚠️ دامنه ست نیست؛ توی Railway متغیر <b>HUB_DOMAIN</b> رو بذار تا دکمه‌ی مینی‌اپ بیاد.")
+    btns = [[Button.url("📱 باز کردن مینی‌اپ", url)]]
+    if web:
+        btns.append([Button.url("🌐 پنل وب", web)])
+    try:
+        msg = await C().send_message(event.chat_id, header + "\n\n👇 مینی‌اپ مدیریتی (اسم اکانت، تایم سلف و همه‌چی توشه):",
+                                     parse_mode="html", buttons=btns, link_preview=False)
+    except Exception:  # noqa
+        return await safe_edit(event, header + f"\n\n📱 مینی‌اپ:\n{url}")
+    try:
+        await event.delete()
+    except Exception:  # noqa
+        pass
+    if CFG["panel_ttl"] > 0 and msg:
+        asyncio.create_task(_delete_later(msg, CFG["panel_ttl"]))
 
 
 THEMES = {"classic": "classic", "کلاسیک": "classic", "mono": "mono", "تکرنگ": "mono",
@@ -501,6 +550,8 @@ async def c_panel(event, arg):
         CFG["theme"] = th
         save_settings()
         return await safe_edit(event, f"🎨 رنگ‌بندی دکمه‌ها: {th}\nبا .پنل ببین")
+    if head in ("app", "miniapp", "مینی‌اپ", "مینیاپ", "مینی"):
+        return await c_panel_app(event)
 
     if a in ("off", "خاموش"):
         for k in F:
@@ -542,6 +593,13 @@ async def c_panel(event, arg):
     elif res == "not_started":
         await safe_edit(event, f"اول توی @{uname} بزن Start، بعد دوباره .پنل رو بزن.")
     elif res in ("no_token", "no_me"):
+        if miniapp.app_url():  # بات نیست ولی دامنه هست → هدر خفن + دکمه‌ی مینی‌اپ
+            try:
+                return await event.edit(await self_mini_header(), parse_mode="html",
+                                        buttons=[[Button.url("📱 باز کردن مینی‌اپ", miniapp.app_url())]],
+                                        link_preview=False)
+            except Exception:  # noqa
+                pass
         await safe_edit(
             event,
             "بات پنل تنظیم نشده (توکن BotFather رو توی پنل وب بذار). فعلاً پنل متنی:\n\n" + panel_text())
