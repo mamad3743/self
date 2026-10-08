@@ -11,6 +11,7 @@ import html
 import asyncio
 
 from aiohttp import web
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -66,7 +67,9 @@ F_PHONE = """<h2>📱 ورود به تلگرام</h2><form method="post" action=
 
 F_CODE = """<h2>💬 کد تایید</h2><form method="post" action="/code">
 <input name="code" placeholder="کد ۵ رقمی" dir="ltr" inputmode="numeric" required>
-<button>تایید</button></form><small>کد داخل خود تلگرام (چت Telegram) برات میاد.</small>"""
+<button>تایید</button></form>
+<form method="post" action="/resend"><button class="red">🔁 ارسال دوباره / روش بعدی</button></form>
+<small>کد رو با فاصله یا خط تیره بنویس (مثلاً 1-2-3-4-5)؛ پشت‌سرهم نوشتنش باعث باطل شدن کد می‌شه.</small>"""
 
 F_2FA = """<h2>🔑 رمز دو مرحله‌ای</h2><form method="post" action="/2fa">
 <input type="password" name="password" placeholder="رمز تایید دو مرحله‌ای" required>
@@ -118,6 +121,10 @@ async def index(request):
         return page(F_API)
     if state["authorized"]:
         return await status_page()
+    if state["step"] == "code":
+        return page(F_CODE, state.get("notice", ""), True)
+    if state["step"] == "phone" and core.api_hint():
+        return page(F_PHONE + f"<small>{html.escape(core.api_hint())}</small>")
     return page({"phone": F_PHONE, "code": F_CODE, "2fa": F_2FA}[state["step"]])
 
 
@@ -157,7 +164,9 @@ async def send_api(request):
 @need_auth
 async def send_phone(request):
     data = await request.post()
-    phone = data["phone"].strip().replace(" ", "")
+    phone = core.normalize_phone(data["phone"])
+    if not phone:
+        return page(F_PHONE, "شماره معتبر نیست؛ مثلاً +989121234567 یا 09121234567")
     try:
         sent = await core.client.send_code_request(phone)
     except ApiIdInvalidError:
@@ -170,8 +179,28 @@ async def send_phone(request):
             pass
         return page(F_API, "API ID یا API Hash اشتباهه، دوباره وارد کن")
     except Exception as e:  # noqa
-        return page(F_PHONE, f"خطا: {e}")
-    state.update(phone=phone, hash=sent.phone_code_hash, step="code")
+        log.warning("send_code failed: %r", e)
+        return page(F_PHONE, f"خطا: {type(e).__name__}: {e}" + (f"\n{core.api_hint()}" if core.api_hint() else ""))
+    state.update(phone=phone, hash=sent.phone_code_hash, step="code", notice=code_notice(sent))
+    raise web.HTTPFound("/")
+
+
+def code_notice(sent) -> str:
+    how, nxt = core.sent_code_info(sent)
+    return f"کد فرستاده شد: {how}" + (f" — اگه نیومد «ارسال دوباره» رو بزن ({nxt})" if nxt else "") + \
+        (f"\n{core.api_hint()}" if core.api_hint() else "")
+
+
+@need_auth
+async def resend(request):
+    if state.get("step") != "code" or not state.get("phone"):
+        raise web.HTTPFound("/")
+    try:
+        sent = await core.client(ResendCodeRequest(state["phone"], state["hash"]))
+    except Exception as e:  # noqa
+        log.warning("resend failed: %r", e)
+        return page(F_CODE, f"ارسال دوباره ممکن نشد: {type(e).__name__}: {e}")
+    state.update(hash=sent.phone_code_hash, notice="🔁 دوباره فرستاده شد. " + code_notice(sent))
     raise web.HTTPFound("/")
 
 
@@ -298,6 +327,7 @@ def main():
         web.post("/api", send_api),
         web.post("/phone", send_phone),
         web.post("/code", send_code),
+        web.post("/resend", resend),
         web.post("/2fa", send_2fa),
         web.post("/settings", settings),
         web.post("/logout", logout),

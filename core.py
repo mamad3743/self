@@ -344,6 +344,56 @@ def load_api():
         API_IS_DEFAULT = True
 
 
+_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def normalize_phone(raw):
+    """«09121234567» / «+98 912 123 4567» / «۹۱۲۱۲۳۴۵۶۷» ← «+989121234567»؛ نامعتبر ← None.
+    اگه کاربر + یا 00 نذاشته باشه و شماره شبیه شماره‌ی ایرانی باشه، +98 اضافه می‌شه."""
+    raw = (raw or "").translate(_DIGITS).strip()
+    explicit = raw.startswith("+") or re.sub(r"[^\d]", "", raw).startswith("00")
+    d = re.sub(r"[^\d]", "", raw)
+    if d.startswith("00"):
+        d = d[2:]
+    if not explicit:
+        if d.startswith("09") and len(d) == 11:
+            d = "98" + d[1:]
+        elif d.startswith("9") and len(d) == 10:
+            d = "98" + d
+    return "+" + d if 8 <= len(d) <= 15 else None
+
+
+_SENT_NAMES = {
+    "SentCodeTypeApp": "📲 داخل اپ تلگرام (چت «Telegram» توی یه دستگاه دیگه‌ی همین اکانت که الان وارده)",
+    "SentCodeTypeSms": "💬 پیامک",
+    "SentCodeTypeCall": "📞 تماس تلفنی (کد رو می‌خونه)",
+    "SentCodeTypeFlashCall": "📞 تماس فلش",
+    "SentCodeTypeMissedCall": "📞 تماس بی‌پاسخ (چند رقم آخر شماره‌ی تماس‌گیرنده = کد)",
+    "SentCodeTypeEmailCode": "📧 ایمیل",
+    "SentCodeTypeFirebaseSms": "💬 پیامک",
+    "SentCodeTypeFragmentSms": "💎 Fragment",
+}
+_NEXT_LABEL = {"SentCodeTypeSms": "💬 ارسال با پیامک", "SentCodeTypeFirebaseSms": "💬 ارسال با پیامک",
+               "SentCodeTypeCall": "📞 تماس تلفنی", "SentCodeTypeFlashCall": "📞 تماس", "SentCodeTypeMissedCall": "📞 تماس",
+               "SentCodeTypeApp": "📲 داخل اپ", "SentCodeTypeEmailCode": "📧 ایمیل"}
+
+
+def sent_code_info(sent):
+    """(توضیح راه ارسال کد، برچسب دکمه‌ی «روش بعدی» یا None)."""
+    t = type(getattr(sent, "type", None)).__name__
+    nxt = getattr(sent, "next_type", None)
+    n = type(nxt).__name__ if nxt is not None else None
+    return _SENT_NAMES.get(t, t), (_NEXT_LABEL.get(n, "🔁 ارسال دوباره") if n else None)
+
+
+API_HINT = ("ℹ️ اگه کد نیومد یا ورود رد شد، دلیلش معمولاً کلید API پیش‌فرضه (تلگرام کلید اپ رسمی رو از کلاینت غیررسمی "
+            "گاهی قبول نمی‌کنه). API_ID و API_HASH اختصاصی خودت رو از my.telegram.org بگیر و توی متغیرها بذار.")
+
+
+def api_hint() -> str:
+    return API_HINT if API_IS_DEFAULT else ""
+
+
 def save_api():
     _write_json(API_FILE, API)
 

@@ -32,8 +32,10 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, PhoneNumberInvalidError,
-    PasswordHashInvalidError, FloodWaitError, ApiIdInvalidError, PhoneNumberBannedError,
+    PasswordHashInvalidError, FloodWaitError, ApiIdInvalidError, PhoneNumberBannedError, PhoneNumberFloodError,
+    SendCodeUnavailableError,
 )
+from telethon.tl.functions.auth import ResendCodeRequest
 
 import boot
 import core
@@ -657,15 +659,34 @@ METHOD_KB = {"inline_keyboard": [[botpanel.btn("🔳 با QR (بدون کد)", "
 
 async def ask_phone(bot, uid, chat):
     LOGIN[uid] = {"step": "phone", "ts": time.time(), "chat": chat, "client": None}
-    await bot.send(chat, "📱 شماره‌ی اکانتت رو با کد کشور بفرست (مثلاً <code>+989121234567</code>).\nلغو: /cancel")
+    await bot.send(chat, "📱 شماره‌ی اکانتت رو بفرست (مثلاً <code>+989121234567</code> یا <code>09121234567</code>).\nلغو: /cancel")
 
 
 def parse_phone(text):
-    t = re.sub(r"[^\d+]", "", num(text))
-    digits = t.lstrip("+")
-    if not 8 <= len(digits) <= 15:
-        return None
-    return "+" + digits
+    return core.normalize_phone(text)
+
+
+def code_prompt(sent) -> tuple:
+    """(متن، کیبورد) بعد از ارسال کد: راه ارسال + هشدار خط تیره + دکمه‌ی روش بعدی."""
+    how, nxt = core.sent_code_info(sent)
+    text = (f"📩 کد فرستاده شد: <b>{how}</b>\n\n"
+            "⚠️ <b>کد رو با فاصله یا خط تیره بنویس</b>، مثلاً <code>1-2-3-4-5</code>. "
+            "اگه پشت‌سرهم بفرستی تلگرام کد رو باطل می‌کنه!")
+    hint = core.api_hint()
+    if hint:
+        text += "\n\n" + html.escape(hint)
+    kb = {"inline_keyboard": [[botpanel.btn(nxt, "rs", "primary")]]} if nxt else None
+    return text, kb
+
+
+def login_error_text(e) -> str:
+    if isinstance(e, PhoneNumberFloodError):
+        return "⏳ این شماره زیاد درخواست کد داده؛ چند ساعت دیگه امتحان کن."
+    if isinstance(e, SendCodeUnavailableError):
+        return "❌ همه‌ی راه‌های ارسال کد (اپ، پیامک، تماس) برای این شماره استفاده شد؛ یه مدت بعد دوباره امتحان کن."
+    if isinstance(e, (ConnectionError, OSError, asyncio.TimeoutError)):
+        return "❌ اتصال به تلگرام برقرار نشد (شبکه یا پروکسی). چند لحظه بعد دوباره امتحان کن."
+    return f"❌ خطا: {type(e).__name__}: {html.escape(str(e))[:150]}"
 
 
 async def handle_login(bot, msg):
@@ -687,11 +708,8 @@ async def handle_login(bot, msg):
             st["client"] = client
             sent = await client.send_code_request(phone)
             st.update(phone=phone, hash=sent.phone_code_hash, step="code")
-            return await bot.send(
-                chat,
-                "📩 کد تلگرام برات اومد (از چت «Telegram» توی همون اکانت).\n\n"
-                "⚠️ <b>کد رو با فاصله یا خط تیره بنویس</b>، مثلاً <code>1-2-3-4-5</code>. "
-                "اگه پشت‌سرهم بفرستی تلگرام کد رو باطل می‌کنه!")
+            text, kb = code_prompt(sent)
+            return await bot.send(chat, text, kb)
         if step == "code":
             code = re.sub(r"\D", "", num(text))
             if not code:
@@ -724,6 +742,14 @@ async def handle_login(bot, msg):
     except ApiIdInvalidError:
         await cleanup_login(uid)
         await bot.send(chat, "❌ API_ID/API_HASH هاب نامعتبره؛ به ادمین خبر بده.")
+    except Exception as e:  # noqa
+        log.warning("[u%s] login error at step %s: %r", uid, step, e)
+        msg = login_error_text(e)
+        if step == "phone":  # بدون این، کاربر هیچ‌چیز نمی‌دید و فکر می‌کرد «کد نمیاد»
+            await cleanup_login(uid)
+            hint = core.api_hint()
+            msg += "\nدوباره /connect" + (f"\n\n{html.escape(hint)}" if hint else "")
+        await bot.send(chat, msg)
 
 
 async def finish_login(bot, uid, chat):
@@ -1344,6 +1370,19 @@ async def on_callback(bot, q):
         await bot.answer(q["id"])
         await bot.edit(cid, mid, "👍 با شماره")
         return await ask_phone(bot, uid, cid)
+    if data == "rs":
+        st = LOGIN.get(uid)
+        if not st or st.get("step") != "code":
+            return await bot.answer(q["id"], "الان کدی منتظر نیست")
+        await bot.answer(q["id"], "در حال ارسال دوباره...")
+        try:
+            sent = await st["client"](ResendCodeRequest(st["phone"], st["hash"]))
+            st["hash"] = sent.phone_code_hash
+            text, kb = code_prompt(sent)
+            return await bot.send(cid, "🔁 دوباره فرستاده شد.\n\n" + text, kb)
+        except Exception as e:  # noqa
+            log.warning("[u%s] resend failed: %r", uid, e)
+            return await bot.send(cid, login_error_text(e))
     if data == "qr":
         await bot.answer(q["id"])
         await bot.edit(cid, mid, "👍 با QR")
