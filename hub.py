@@ -2364,9 +2364,12 @@ async def serve_app(request):
 DEPLOY_PAGE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>دیپلوی سلف روی Railway خودت</title>
+<link rel="preload" href="/font/vazirmatn.woff2" as="font" type="font/woff2" crossorigin>
 <style>
+@font-face{font-family:"Vazirmatn";src:url(/font/vazirmatn.woff2) format("woff2");font-weight:100 900;font-style:normal;font-display:swap}
 :root{--o1:#ff5a00;--o2:#ff8a1f;--bg:#07070a;--card:#0e0e12;--line:#2b2015;--txt:#f4efe9;--mut:#9a8f84}
-*{box-sizing:border-box}body{margin:0;font-family:Vazirmatn,system-ui,Tahoma,sans-serif;background:var(--bg);color:var(--txt);padding:22px 14px 40px}
+*{box-sizing:border-box}body{margin:0;font-family:Vazirmatn,system-ui,-apple-system,"Segoe UI",Tahoma,"Noto Sans Arabic",sans-serif;line-height:1.7;background:var(--bg);color:var(--txt);padding:22px 14px 40px}
+button{font-family:inherit}
 .card{max-width:480px;margin:0 auto;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px}
 h1{font-size:19px;margin:0 0 6px}p,small{color:var(--mut);font-size:13px;line-height:1.9}
 input{width:100%;padding:12px;margin:6px 0;border-radius:11px;border:1px solid #2c2118;background:#09090c;color:var(--txt);font-size:15px;font-family:inherit}
@@ -2742,6 +2745,7 @@ def main():
     app.add_routes([
         web.get("/", health),
         web.get("/app", serve_app),
+        web.get("/font/vazirmatn.woff2", miniapp.serve_font),
         web.get("/login", web_login_page),
         web.post("/login/{action}", web_login_post),
         web.get("/deploy", serve_deploy),

@@ -14,6 +14,53 @@ import os
 
 # دامنه‌ای که خودمون یاد می‌گیریم (وقتی کسی صفحه‌ی وب سلف رو باز می‌کنه) یا از دکمه‌ی منوی BotFather می‌خونیم؛
 # برای وقتی که متغیر HUB_DOMAIN / RAILWAY_PUBLIC_DOMAIN ست نشده.
+# ───────────── فونت Vazirmatn (فارسی) ─────────────
+# فایل فونت (زیرمجموعه‌ی ۹۴ کیلوبایتیِ متغیر، وزن ۱۰۰ تا ۹۰۰، لایسنس OFL) از خود سرور سرو می‌شه؛ هیچ وابستگی بیرونی نیست.
+FONT_URL = "/font/vazirmatn.woff2"
+FONT_FACE = ('@font-face{font-family:"Vazirmatn";src:url(' + FONT_URL + ') format("woff2");'
+             'font-weight:100 900;font-style:normal;font-display:swap}')
+FONT_STACK = 'Vazirmatn,system-ui,-apple-system,"Segoe UI",Tahoma,"Noto Sans Arabic",sans-serif'
+FONT_PRELOAD = '<link rel="preload" href="' + FONT_URL + '" as="font" type="font/woff2" crossorigin>'
+_FONT = {"data": None, "etag": ""}
+
+
+def _font_candidates():
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.environ.get("SELF_REPO_DIR") or here  # وقتی کد از /data/code لود شده، فونت کنار ریپوئه
+    return [os.path.join(d, "fonts", "Vazirmatn-subset.woff2") for d in (repo, here)]
+
+
+def font_bytes():
+    """بایت‌های فونت (کش حافظه) یا None اگه فایل نبود."""
+    if _FONT["data"] is None:
+        for p in _font_candidates():
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if data[:4] == b"wOF2":  # فقط woff2 معتبر
+                import hashlib
+                _FONT.update(data=data, etag='"' + hashlib.sha1(data).hexdigest()[:16] + '"')
+                break
+        else:
+            _FONT["data"] = b""
+    return _FONT["data"] or None
+
+
+async def serve_font(request):
+    """GET /font/vazirmatn.woff2 — بدون نیاز به ورود (صفحه‌ی ورود هم فونت می‌خواد)؛ کش یک‌ساله + ETag."""
+    from aiohttp import web
+    data = font_bytes()
+    if not data:
+        return web.Response(status=404, text="font not found")
+    headers = {"Cache-Control": "public, max-age=31536000, immutable", "ETag": _FONT["etag"],
+               "X-Content-Type-Options": "nosniff", "Access-Control-Allow-Origin": "*"}
+    if request.headers.get("If-None-Match") == _FONT["etag"]:
+        return web.Response(status=304, headers=headers)
+    return web.Response(body=data, content_type="font/woff2", headers=headers)
+
+
 LEARNED = {"host": "", "menu_url": ""}
 
 
@@ -87,12 +134,15 @@ def verify_user(init_data: str, bot_token: str, max_age: int = 86400):
 
 HTML = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<link rel="preload" href="/font/vazirmatn.woff2" as="font" type="font/woff2" crossorigin>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <title>سلف · مینی‌اپ</title>
 <style>
+@font-face{font-family:"Vazirmatn";src:url(/font/vazirmatn.woff2) format("woff2");font-weight:100 900;font-style:normal;font-display:swap}
+button,input,select,textarea{font-family:inherit}
 :root{--o1:#ff5a00;--o2:#ff8a1f;--o3:#ffc15e;--bg:#07070a;--card:#101014;--card2:#17171e;--line:#2b2015;--txt:#f4efe9;--mut:#9a8f84;--glow:rgba(255,106,0,.35);--grn:#2cff85;--red:#ff6b57}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
-body{margin:0;font-family:system-ui,Vazirmatn,Tahoma,sans-serif;color:var(--txt);padding:0 0 46px;min-height:100vh;background:radial-gradient(600px 300px at 85% -60px,rgba(255,106,0,.16),transparent 70%),radial-gradient(500px 260px at 0% 0%,rgba(255,45,0,.1),transparent 65%),var(--bg)}
+body{margin:0;font-family:Vazirmatn,system-ui,-apple-system,"Segoe UI",Tahoma,"Noto Sans Arabic",sans-serif;line-height:1.7;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;color:var(--txt);padding:0 0 46px;min-height:100vh;background:radial-gradient(600px 300px at 85% -60px,rgba(255,106,0,.16),transparent 70%),radial-gradient(500px 260px at 0% 0%,rgba(255,45,0,.1),transparent 65%),var(--bg)}
 .topbar{height:3px;background:linear-gradient(90deg,transparent,var(--o1),var(--o3),var(--o1),transparent);background-size:200% 100%;animation:slide 4s linear infinite}
 @keyframes slide{to{background-position:-200% 0}}
 .wrap{padding:14px 12px 0;max-width:560px;margin:0 auto}

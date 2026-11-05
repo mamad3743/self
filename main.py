@@ -33,12 +33,14 @@ from core import F, CFG, FEATS, FONTS, state, log, save_settings, save_api, save
 
 TEMPLATE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#07070a">
+<link rel="preload" href="/font/vazirmatn.woff2" as="font" type="font/woff2" crossorigin>
 <title>پنل سلف · Erfan</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%A5%3C/text%3E%3C/svg%3E">
 <style>
+@font-face{font-family:"Vazirmatn";src:url(/font/vazirmatn.woff2) format("woff2");font-weight:100 900;font-style:normal;font-display:swap}
 :root{--o1:#ff5a00;--o2:#ff8a1f;--o3:#ffc15e;--bg:#07070a;--card:#0e0e12;--card2:#15151b;--line:#2b2015;--txt:#f4efe9;--mut:#9a8f84;--glow:rgba(255,106,0,.35)}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
-body{margin:0;min-height:100vh;font-family:Vazirmatn,system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;color:var(--txt);background:var(--bg);overflow-x:hidden}
+body{margin:0;min-height:100vh;font-family:Vazirmatn,system-ui,-apple-system,"Segoe UI",Tahoma,"Noto Sans Arabic",sans-serif;color:var(--txt);background:var(--bg);overflow-x:hidden;line-height:1.7;font-weight:400;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
 /* پس‌زمینه: توپ‌های نوری + شبکه + نویز */
 .bg{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
 .orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:.55;animation:float 14s ease-in-out infinite}
@@ -80,7 +82,7 @@ form{margin:0}
 input,select,button{width:100%;padding:13px 14px;margin:6px 0;border-radius:12px;border:1px solid #2c2118;background:#09090c;color:var(--txt);font-size:16px;font-family:inherit;outline:none;transition:border-color .2s,box-shadow .2s,transform .15s,background .2s}
 input::placeholder{color:#6f655b}
 input:focus,select:focus{border-color:var(--o2);box-shadow:0 0 0 3px rgba(255,138,31,.18),0 0 22px -6px var(--glow)}
-button{position:relative;overflow:hidden;border:0;cursor:pointer;font-weight:800;letter-spacing:.2px;color:#170a00;background:linear-gradient(135deg,var(--o2),var(--o1));box-shadow:0 10px 26px -10px var(--glow)}
+button{position:relative;overflow:hidden;border:0;cursor:pointer;font-weight:800;letter-spacing:0;color:#170a00;background:linear-gradient(135deg,var(--o2),var(--o1));box-shadow:0 10px 26px -10px var(--glow)}
 button:before{content:"";position:absolute;top:0;left:-120%;width:60%;height:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);transform:skewX(-20deg);transition:left .6s}
 button:hover:before{left:140%}
 button:hover{transform:translateY(-1px);box-shadow:0 14px 30px -10px rgba(255,106,0,.65)}
@@ -104,7 +106,7 @@ a{color:var(--o2);text-decoration:none}a:hover{color:var(--o3)}
 .chips{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:6px}
 .chip{font-size:12px;padding:6px 11px;border-radius:99px;background:var(--card2);border:1px solid #2b2015;color:#d6cabd}
 .chip b{color:var(--o2)}
-.sec{margin:18px 0 8px;font-size:12px;letter-spacing:.6px;color:var(--o2);font-weight:700;display:flex;align-items:center;gap:8px}
+.sec{margin:18px 0 8px;font-size:12px;letter-spacing:0;color:var(--o2);font-weight:700;display:flex;align-items:center;gap:8px;letter-spacing:0}
 .sec:after{content:"";flex:1;height:1px;background:#2a1f15}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 label.chk{position:relative;display:flex;align-items:center;gap:10px;padding:10px 11px;margin:0;border-radius:12px;background:var(--card2);border:1px solid #261c13;cursor:pointer;font-size:13px;transition:border-color .2s,background .2s,transform .15s;user-select:none}
@@ -707,6 +709,7 @@ def main():
         web.post("/settings", settings),
         web.post("/logout", logout),
         web.get("/app", mini_app_page),
+        web.get("/font/vazirmatn.woff2", miniapp.serve_font),
         web.post("/api/me", mini_api_me),
         web.post("/api/toggle", mini_api_toggle),
         web.post("/api/control", mini_api_control),
