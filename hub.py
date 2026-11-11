@@ -1,15 +1,17 @@
-"""هاب چندکاربره: یه بات مشترک؛ هر کس اکانت خودش رو وصل می‌کنه و سلفش توی یه پردازش جدا اجرا می‌شه.
+"""هاب چندکاربره: یه بات مشترک برای همه. هر کس اکانت خودش رو وصل می‌کنه و سلفش خودکار ساخته و روی همین سرور اجرا می‌شه.
 
-مدل تک‌بات: هیچ کاربری بات جدا (BotFather) نمی‌خواد؛ فقط همین یه بات (HUB_BOT_TOKEN) برای همه‌ست.
-داخل بات: اتصال اکانت، پنل قابلیت‌ها + بازی میویی، روشن/خاموش/ریستارت سلف،
-پشتیبان‌گیری کامل و بازیابی، راهنمای دیپلوی روی Railway، و مینی‌اپ (WebApp) برای هر نفر.
+بدون توکن و بدون بات جدا: کاربر فقط /start می‌زنه ← «ساخت سلف من» ← شماره ← کد ← (رمز دومرحله‌ای) ← سلف آماده‌ست.
+ورود: داخل بات (شماره/QR) یا صفحه‌ی وب. بعدش: پنل قابلیت‌ها + بازی میویی، روشن/خاموش/ریستارت،
+پشتیبان‌گیری کامل و بازیابی، و مینی‌اپ (WebApp) برای هر نفر.
 
 فعال‌سازی (متغیرهای Railway):
   HUB_BOT_TOKEN = توکن بات مشترک (BotFather)      HUB_ADMIN_ID = آیدی عددی تو (ادمین)
   API_ID / API_HASH = اختیاری (از my.telegram.org)  MAX_USERS = سقف کاربر (پیش‌فرض ۵)
+  HUB_OPEN = 1/0 ثبت‌نام باز (پیش‌فرض ۱: هر کس خودکار ثبت می‌شه؛ ۰ = فقط با تأیید ادمین)
+  HUB_TRIAL_DAYS = دوره‌ی آزمایشی کاربر جدید به روز (پیش‌فرض ۰ = نامحدود)
   HUB_DIR = پوشه‌ی داده (پیش‌فرض /data/hub)   PROXY = اختیاری
   MAX_RSS_MB = سقف رم هر سلف (۰ = بدون سقف)   BACKUP_HOURS = فاصله‌ی بکاپ خودکار (پیش‌فرض ۲۴)
-  HUB_DOMAIN = دامنه‌ی عمومی Railway (مثل xxx.up.railway.app) برای دکمه‌ی مینی‌اپ (اختیاری)
+  HUB_DOMAIN = دامنه‌ی عمومی Railway (مثل xxx.up.railway.app) برای مینی‌اپ و ورود وب (اختیاری)
 
 هر کاربر: /data/hub/<id>/ شامل session.txt، settings.json، ctl.jsonl (صف دستور)، status.json.
 دستورهای نقطه‌ای (.میویی و...) توی چت‌های خود کاربر مثل قبل کار می‌کنن؛ بات برای اتصال، پنل، وضعیت و مدیریته.
@@ -54,13 +56,10 @@ import botpanel
 import weblogin
 import meow
 import updater
-import railway
 import miniapp
 from core import FEATS, FEAT, GRID, log
 
 REPO = os.environ.get("SELF_REPO_DIR") or os.path.dirname(os.path.abspath(__file__))
-SELF_REPO = os.getenv("SELF_REPO", "mamad3743/self")
-SELF_BRANCH = os.getenv("SELF_BRANCH", "main") or "main"
 DEFAULT_FLAGS = dict(core.F)  # پیش‌فرض قابلیت‌ها (قبل از هر load_settings)
 HIDDEN = {"update"}  # از پنل کاربرها مخفیه
 
@@ -79,8 +78,6 @@ INSTANCES = {}
 LOGIN = {}  # uid -> وضعیت مراحل ورود
 REQ_TS = {}  # uid -> زمان آخرین درخواست دسترسی
 LOGIN_TTL = 600
-DEPLOY_STATE = {}  # uid -> مرحله‌ی دیپلوی با توکن ریلوی خودش
-DEPLOY_TTL = 600
 SNIPPET = (
     "# SELF_HUB_CHILD\n"  # برچسب برای پیدا کردن سلف‌های یتیم توی kill_stale
     "import sys, os, runpy\n"
@@ -93,11 +90,26 @@ SNIPPET = (
 )
 
 
+TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
+
+
+def clean_token(raw: str) -> str:
+    """توکن BotFather رو تمیز می‌کنه: فاصله، خط جدید، گیومه و پیشوند «bot» که موقع paste توی Railway همراهش میاد
+    (دلیل رایج «توکن قبول نمی‌شه»)."""
+    t = (raw or "").strip().strip("\"'`").strip()
+    t = re.sub(r"\s+", "", t)
+    if t.lower().startswith("bot") and ":" in t[3:]:
+        t = t[3:]
+    return t
+
+
 def configure(env=None):
-    global TOKEN, ADMIN, DATA, MAX_USERS, API_ID, API_HASH, MAX_RSS_MB, BACKUP_HOURS, DOMAIN
+    global TOKEN, ADMIN, DATA, MAX_USERS, API_ID, API_HASH, MAX_RSS_MB, BACKUP_HOURS, DOMAIN, OPEN_DEFAULT, TRIAL_DEFAULT
     env = env if env is not None else os.environ
-    TOKEN = env.get("HUB_BOT_TOKEN", "")
-    ADMIN = int(env.get("HUB_ADMIN_ID") or 0)
+    TOKEN = clean_token(env.get("HUB_BOT_TOKEN", ""))
+    ADMIN = int(re.sub(r"\D", "", env.get("HUB_ADMIN_ID") or "") or 0)
+    OPEN_DEFAULT = (env.get("HUB_OPEN", "1").strip() not in ("0", "false", "False", "no", "off"))
+    TRIAL_DEFAULT = int(re.sub(r"\D", "", env.get("HUB_TRIAL_DAYS") or "") or 0)
     DATA = env.get("HUB_DIR", "/data/hub")
     MAX_USERS = int(env.get("MAX_USERS") or 5)
     MAX_RSS_MB = int(env.get("MAX_RSS_MB") or 0)
@@ -105,6 +117,8 @@ def configure(env=None):
     DOMAIN = (env.get("HUB_DOMAIN") or env.get("RAILWAY_PUBLIC_DOMAIN") or "").strip().rstrip("/")
     if DOMAIN and not DOMAIN.startswith("http"):
         DOMAIN = "https://" + DOMAIN
+    if TOKEN and not TOKEN_RE.match(TOKEN):
+        log.warning("HUB_BOT_TOKEN قالب معتبری نداره (باید مثل 123456789:AAH... باشه)؛ از BotFather دوباره کپی کن.")
     core.load_api()
     API_ID = int(env.get("API_ID") or 0) or core.API["id"]
     API_HASH = env.get("API_HASH") or core.API["hash"]
@@ -184,6 +198,7 @@ def sub_text(uid) -> str:
 
 
 def allow_user(target, name="", days=0):
+    unban_user(target)
     reg = load_reg()
     old = reg["allowed"].get(str(target), {})
     reg["allowed"][str(target)] = {
@@ -502,9 +517,6 @@ def status_text(uid) -> str:
     if mem:
         lines.append(f"🧠 رم: {mem:.0f} MB")
     lines.append(f"🎫 اشتراک: {sub_text(uid)}")
-    rec = deploy_record(uid)
-    if rec and rec.get("domain"):
-        lines.append(f"🌐 دامنه‌ی سلف‌ت: https://{html.escape(rec['domain'])}")
     flags = read_flags(uid)
     on = [FEAT[k]["emoji"] + " " + FEAT[k]["name"] for k in FEAT if flags.get(k) and k not in HIDDEN and FEAT[k]["toggle"]]
     lines.append(f"\n🎛 قابلیت‌های روشن ({len(on)}): " + ("، ".join(on) if on else "—"))
@@ -541,16 +553,14 @@ def main_text(uid) -> str:
         tg = "📡 —"
     mem = inst.rss() if inst else None
     mem_s = f" · 🧠 {mem:.0f}MB" if mem else ""
-    rec = deploy_record(uid)
-    dom_s = f"\n🌐 دامنه‌ی سلف‌ت: https://{html.escape(rec['domain'])}" if rec and rec.get("domain") else ""
     loops_s = ""
     if fresh and st.get("loops"):
         loops_s = "\n🔄 " + " · ".join(f"{LOOP_NAMES.get(k, k)} ({n})" for k, n in st["loops"].items())
     return ("🔥 <b>پنل مدیریت سلف</b>\n"
             f"🤖 {run} {tg}{mem_s}\n"
-            f"🎫 {sub_text(uid)}{dom_s}{loops_s}\n"
+            f"🎫 {sub_text(uid)}{loops_s}\n"
             f"🎛 <b>{on}</b> از {total} قابلیت روشن — 🟢 روشن · 🔴 خاموش · 🔵 دستوری\n\n"
-            "👆 مدیریت سلف (وضعیت، روشن/خاموش، بکاپ، دیپلوی، مینی‌اپ)\n"
+            "👆 مدیریت سلف (وضعیت، روشن/خاموش، بکاپ، مینی‌اپ)\n"
             "👇 هر قابلیت رو بزن تا راهنما و نمونه دستورش رو ببینی\n"
             "🐱 دستورهای بازی (<code>.میویی</code> <code>.ماهیگیری</code> ...) رو توی همون چت بازی بزن")
 
@@ -570,7 +580,7 @@ def manage_keyboard(uid) -> list:
          botpanel.btn("🔄 ریستارت", "mg:restart", "primary")],
         [botpanel.btn("💾 بکاپ", "mg:backup", "primary"),
          botpanel.btn("♻️ بازیابی آخر", "mg:restore_last", "primary"),
-         botpanel.btn("🚀 دیپلوی", "mg:deploy", "primary")],
+         botpanel.btn("❓ راهنما", "mg:help", "primary")],
     ]
     url = app_base_url()
     if url:
@@ -593,101 +603,28 @@ def main_keyboard(uid) -> dict:
     return {"inline_keyboard": rows}
 
 
-# ───────────── دیپلوی روی اکانت خود کاربر (نه روی اکانت ادمین) ─────────────
-# هر کس توکن Railway خودش رو می‌ده و بات از ریپوی mamad3743/self براش پروژه‌ی جدا می‌سازه.
-def deploy_dir(uid) -> str:
-    return os.path.join(DATA, "deploys", str(uid))
 
 
-def deploy_record(uid) -> dict | None:
-    return read_json(os.path.join(deploy_dir(uid), "deploy.json"), None)
 
 
-def save_deploy_record(uid, rec: dict):
-    os.makedirs(deploy_dir(uid), exist_ok=True)
-    write_json(os.path.join(deploy_dir(uid), "deploy.json"), rec)
 
 
-def deploy_token_path(uid) -> str:
-    return os.path.join(deploy_dir(uid), "railway_token")
 
 
-def save_deploy_token(uid, token: str):
-    os.makedirs(deploy_dir(uid), exist_ok=True)
-    with open(deploy_token_path(uid), "w") as f:
-        f.write(token.strip())
-    try:
-        os.chmod(deploy_token_path(uid), 0o600)
-    except OSError:
-        pass
 
 
-def load_deploy_token(uid) -> str:
-    try:
-        return open(deploy_token_path(uid)).read().strip()
-    except OSError:
-        return ""
 
 
-def forget_deploy_token(uid):
-    try:
-        os.remove(deploy_token_path(uid))
-    except OSError:
-        pass
 
 
-def purge_deploy_states():
-    now = time.time()
-    for u in [u for u, s in DEPLOY_STATE.items() if now - s.get("ts", 0) > DEPLOY_TTL]:
-        DEPLOY_STATE.pop(u, None)
 
 
-DEPLOY_TEXT = (
-    "🚀 <b>دیپلوی سلف روی Railway خودت</b>\n\n"
-    "سلف هیچ‌کس روی اکانت من ساخته نمی‌شه — هر کس با <b>توکن Railway خودش</b> از ریپوی "
-    f"<code>{html.escape(SELF_REPO if 'SELF_REPO' in dir() else 'mamad3743/self')}</code> براش پروژه‌ی جدا ساخته می‌شه.\n\n"
-    "<b>روش خودکار (تو همین بات):</b>\n"
-    "1️⃣ برو railway.com/account/tokens و یه <b>Account Token</b> بساز\n"
-    "2️⃣ توی بات /deploy بزن ← «🚀 شروع دیپلوی خودکار» ← توکن رو بفرست (بعد خوندن پاک می‌شه)\n"
-    "3️⃣ رمز پنل وب + (اختیاری) API_ID/API_HASH رو بده\n"
-    "4️⃣ بات پروژه + سرویس + متغیرها + Volume (/data) + دامنه رو می‌سازه و دیپلوی می‌کنه\n"
-    "5️⃣ دامنه رو باز کن، وارد شو و شماره/کد تلگرام رو بزن — تمام\n\n"
-    "<b>روش وب:</b> همین فرم رو توی مرورگر پر کن (توکن فقط برای همین یه بار استفاده می‌شه):\n"
-    "{web_line}\n"
-    "💡 دستورها: /deploy (شروع) · /deploy_status (وضعیت) · /redeploy (دیپلوی دوباره) · /forget (حذف توکن ذخیره‌شده)"
-)
 
 
-def deploy_menu_text(web_url: str) -> str:
-    wl = f"\n🌐 فرم وب دیپلوی:\n{html.escape(web_url)}" if web_url else "\n🌐 فرم وب: ادمین هنوز دامنه رو ست نکرده."
-    return DEPLOY_TEXT.format(web_line=wl)
 
 
-def deploy_menu_kb(web_url: str | None = None) -> dict:
-    rows = [
-        [botpanel.btn("🚀 شروع دیپلوی خودکار", "dp:auto", "success"),
-         botpanel.btn("📖 آموزش دستی", "dp:manual", "primary")],
-        [botpanel.btn("📊 وضعیت دیپلوی", "dp:status", "primary"),
-         botpanel.btn("🔄 ریدیپلوی", "dp:redeploy", "primary")],
-        [botpanel.btn("🗑 حذف توکن", "dp:forget", "danger"),
-         botpanel.btn("❌ بستن", "x", "danger")],
-    ]
-    if web_url:
-        rows.insert(0, [{"text": "🌐 فرم وب دیپلوی", "web_app": {"url": web_url}}])
-    return {"inline_keyboard": rows}
 
 
-MANUAL_DEPLOY = (
-    "📖 <b>دیپلوی دستی از گیت‌هاب</b>\n\n"
-    "1️⃣ Railway ← New Project ← Deploy from GitHub ← ریپوی <code>{repo}</code> (اول Fork کن اگه لازمه)\n"
-    "2️⃣ Variables (همون چیزایی که بات خودکار ست می‌کنه):\n"
-    "<code>PANEL_PASSWORD</code> = یه رمز قوی (لازم)\n"
-    "<code>API_ID</code> / <code>API_HASH</code> = از my.telegram.org (اختیاری ولی پیشنهادی)\n"
-    "<code>TIMEZONE</code> = Asia/Tehran\n"
-    "3️⃣ Volume با Mount Path = <code>/data</code> اضافه کن\n"
-    "4️⃣ Settings ← Networking ← Generate Domain\n"
-    "5️⃣ دامنه رو باز کن ← رمز پنل ← شماره ← کد ← تمام ✅"
-)
 
 MINIAPP_HELP = (
     "📱 <b>مینی‌اپ سلف</b>\n\n"
@@ -728,100 +665,178 @@ def feat_keyboard(key) -> dict:
 
 
 HELP = (
-    "🐾 <b>هاب سلف — یه بات برای همه</b>\n\n"
-    "لازم نیست بات جدا بزنی؛ همین یه بات برای تو و بقیه‌ست. اکانتت رو وصل می‌کنی، "
-    "سلف مخصوص خودت روی سرور (Railway) اجرا می‌شه و از همین‌جا + مینی‌اپ کنترلش می‌کنی.\n\n"
-    "/connect ← وصل کردن اکانت (QR یا شماره)\n"
-    "/panel ← پنل مدیریتی (روشن/خاموش سلف، قابلیت‌ها، بازی، بکاپ، دیپلوی، مینی‌اپ)\n"
+    "🐾 <b>سلف تلگرام — یه بات برای همه</b>\n\n"
+    "بات جدا نمی‌خوای، توکن هم لازم نیست: اکانتت رو وصل می‌کنی و سلف مخصوص خودت "
+    "<b>خودکار روی سرور ساخته و اجرا می‌شه</b>.\n\n"
+    "/start ← شروع و ساخت سلف\n"
+    "/connect ← وصل کردن اکانت (شماره ← کد ← رمز دومرحله‌ای، یا QR، یا صفحه‌ی وب)\n"
+    "/panel ← پنل مدیریتی (روشن/خاموش سلف، قابلیت‌ها، بازی، بکاپ، مینی‌اپ)\n"
     "/status ← وضعیت سلفت\n"
     "/app ← لینک مینی‌اپ (کنترل لمسی کامل)\n"
-    "/deploy ← دیپلوی سلف روی <b>Railway خودت</b> با توکن خودت (نه روی اکانت من)\n"
-    "/deploy_status · /redeploy · /forget ← وضعیت، دیپلوی دوباره، حذف توکن\n"
     "/cmd ← اجرای دستور توی یه چت، مثلاً <code>/cmd me .وضعیت چت</code> یا <code>/cmd @group .میویی</code>\n"
     "/run · /stop · /restart ← روشن / خاموش / ریستارت سلف\n"
     "/backup ← بکاپ تنظیمات · /backup_full ← بکاپ کامل (تنظیمات + سشن، زیپ)\n"
     "/restore ← بازیابی (فایل json/zip با کپشن /restore یا <code>/restore last</code>)\n"
     "/disconnect ← خروج کامل و حذف اطلاعات\n\n"
-    "بعد از وصل شدن، دستورهای نقطه‌ای (<code>.میویی</code> <code>.ماهیگیری</code> <code>.یخچال</code> <code>.پیشی</code> <code>.خفاش</code> <code>.نجات</code> و...) رو توی خود تلگرامت بزن."
+    "بعد از وصل شدن، دستورهای نقطه‌ای (<code>.میویی</code> <code>.ماهیگیری</code> <code>.یخچال</code> "
+    "<code>.پیشی</code> <code>.خفاش</code> <code>.نجات</code> و...) رو توی خود تلگرامت بزن."
 )
 ADMIN_HELP = (
     "\n\n<b>ادمین:</b>\n/users ← لیست کاربرها (اشتراک و رم)\n/allow &lt;id&gt; [روز] [نام] ← دسترسی (بدون روز = نامحدود)\n"
-    "/extend &lt;id&gt; &lt;روز&gt; ← تمدید · /revoke &lt;id&gt; ← گرفتن دسترسی\n"
+    "/extend &lt;id&gt; &lt;روز&gt; ← تمدید · /revoke &lt;id&gt; ← گرفتن دسترسی و مسدود کردن\n"
+    "/open on|off ← ثبت‌نام باز (هر کس خودکار ثبت می‌شه) · <code>/open trial 7</code> ← دوره‌ی آزمایشی (روز؛ ۰ = نامحدود)\n"
     "/stop · /run · /restart &lt;id&gt; ← مدیریت سلف هر کاربر · /log [id] ← لاگ\n"
     "/broadcast &lt;متن&gt; ← پیام به همه · /dump ← بکاپ کامل همه‌ی کاربرها (زیپ، ادمین)\n"
     "بروزرسانی: فایل زیپ رو با کپشن <code>/update</code> بفرست"
 )
-# ───────────── شروع عمومی: برای همه بالا میاد (بدون نیاز به تأیید) ─────────────
-# هیچ سلفی روی اکانت ادمین ساخته نمی‌شه؛ هر کس با توکن Railway خودش دیپلوی جدا می‌گیره.
+# ───────────── شروع: یه بات برای همه، بدون توکن ─────────────
 START_PUBLIC = (
-    "🐾 <b>ساخت سلف روی Railway خودت</b>\n\n"
-    "سلام! با همین بات برای خودت یه سلف جدا می‌سازی — <b>روی اکانت Railway خودت</b>، نه روی اکانت من.\n\n"
-    "🚀 <b>ساخت سلف:</b> توکن Railway رو می‌دی، از ریپوی <code>{repo}</code> برات پروژه ساخته و دیپلوی می‌شه "
-    "(سرویس + متغیرها + Volume روی /data + دامنه).\n"
-    "📱 بعدش سلف خودت پنل وب + مینی‌اپ + همه‌ی قابلیت‌ها (میویی، ماهیگیری، یخچال، پیشی، خفاش، نجات، بکاپ و...) رو داره.\n\n"
-    "👇 یه گزینه رو بزن:"
+    "🐾 <b>سلف تلگرام — یه بات برای همه</b>\n\n"
+    "لازم نیست بات بسازی، توکن بدی یا چیزی نصب کنی. فقط اکانتت رو وصل کن؛ "
+    "سلف مخصوص خودت <b>خودکار روی سرور ساخته و اجرا می‌شه</b>.\n\n"
+    "۱️⃣ شماره‌ات رو بده\n"
+    "۲️⃣ کدی که تلگرام می‌فرسته رو وارد کن\n"
+    "۳️⃣ اگه رمز دومرحله‌ای داری، اون رو بده\n\n"
+    "بعدش از همین بات + مینی‌اپ کنترلش می‌کنی: بازی میویی (میو، ماهیگیری، یخچال، پیشی، خفاش، نجات)، "
+    "مدیریت گروه، پشتیبان‌گیری و بقیه‌ی قابلیت‌ها.\n\n"
+    "👇 برای شروع بزن:"
 )
 PUBLIC_HELP = (
     "❓ <b>راهنما</b>\n\n"
-    "🚀 /deploy ← شروع ساخت سلف (توکن Railway خودت رو از railway.com/account/tokens بساز)\n"
-    "📊 /deploy_status ← وضعیت دیپلوی‌ت\n"
-    "🔄 /redeploy ← دیپلوی دوباره\n"
-    "🗑 /forget ← حذف توکن ذخیره‌شده\n\n"
-    "بعد از دیپلوی، دامنه‌ای که بات می‌ده رو باز کن، با رمزت وارد شو و شماره/کد تلگرام رو بزن. تمام ✅"
+    "🚀 «ساخت سلف من» یا /connect ← شماره ← کد ← (رمز دومرحله‌ای) ← سلفت خودکار ساخته می‌شه.\n"
+    "🔳 اگه نمی‌خوای کد بزنی: ورود با QR (از یه دستگاه دیگه) یا «ورود از صفحه‌ی وب».\n"
+    "📱 بعد از ساخته شدن: /panel و /app (مینی‌اپ).\n\n"
+    "هیچ توکن یا بات جداگانه‌ای لازم نیست."
 )
 FEATURES_PUBLIC = (
-    "✨ <b>قابلیت‌های سلف تو (بعد از دیپلوی)</b>\n\n"
-    "🤖 سلف کامل روی اکانت خودت: پنل وب + مینی‌اپ\n"
-    "🐱 بازی میویی: میو، ماهیگیری، یخچال، پیشی، خفاش، نجات خودکار\n"
+    "✨ <b>قابلیت‌های سلف تو</b>\n\n"
+    "🐱 بازی میویی: میو، ماهیگیری، یخچال، پیشی (برداشت میو پوینت)، خفاش، نجات خودکار\n"
     "🛡 مدیریت گروه: نگهبان، قفل‌ها، فیلتر، عضویت اجباری، سکوت\n"
+    "⏰ ساعت، تاریخ شمسی، منشی، پاسخ خودکار، آفلاین، ضد حذف و...\n"
     "💾 پشتیبان‌گیری و بازیابی کامل\n"
-    "⏰ ساعت، تاریخ شمسی، منشی، پاسخ خودکار، آفلاین و...\n\n"
-    "برای ساختش /deploy بزن 🚀"
+    "📱 مینی‌اپ + پنل دکمه‌ای برای کنترل از همین بات\n\n"
+    "همه‌ش با یه بار وصل کردن اکانت 👇"
 )
-PUBLIC_CMDS = {"/deploy", "/deploy_status", "/redeploy", "/forget", "/cancel"}
+READY_TEXT = ("🟢 <b>سلفت ساخته شد و روشنه!</b>\n\n"
+              "حالا توی هر چت (مثلاً چت بازی میویی) دستورهای نقطه‌ای رو بزن:\n"
+              "<code>.میویی</code> · <code>.ماهیگیری</code> · <code>.یخچال</code> · <code>.پیشی</code>\n"
+              "یا از دکمه‌های زیر کنترلش کن 👇")
 
 
-def public_start_kb() -> dict:
-    rows = [[botpanel.btn("🚀 ساخت سلف روی ریلوی", "dp:auto", "success")]]
-    w = deploy_web_url()
-    if w:
-        rows.append([{"text": "🌐 فرم وب دیپلوی", "web_app": {"url": w}}])
-    rows += [[botpanel.btn("📖 آموزش دستی", "dp:manual", "primary"),
-              botpanel.btn("📊 وضعیت دیپلوی", "dp:status", "primary")],
-             [botpanel.btn("✨ قابلیت‌ها", "st:features", "primary"),
-              botpanel.btn("❓ راهنما", "st:help", "primary")]]
+def public_start_kb(uid=None) -> dict:
+    rows = [[botpanel.btn("🚀 ساخت سلف من", "ob:go", "success")],
+            [botpanel.btn("✨ قابلیت‌ها", "st:features", "primary"), botpanel.btn("❓ راهنما", "st:help", "primary")]]
     return {"inline_keyboard": rows}
 
 
-async def send_public_start(bot, cid):
-    await bot.send(cid, START_PUBLIC.format(repo=html.escape(SELF_REPO)), public_start_kb())
+def ready_kb(uid) -> dict:
+    rows = [[botpanel.btn("⚙️ پنل", "m", "primary"), botpanel.btn("📊 وضعیت", "mg:status", "primary")]]
+    url = app_base_url()
+    if url:
+        rows.insert(0, [{"text": "📱 باز کردن مینی‌اپ", "web_app": {"url": url}}])
+    return {"inline_keyboard": rows}
 
 
-async def handle_public_cmd(bot, uid, cid, cmd, arg) -> bool:
-    """دستورهای عمومی (برای همه، بدون تأیید). True یعنی مصرف شد."""
-    if cmd == "/deploy":
-        await bot.send(cid, deploy_menu_text(deploy_web_url()), deploy_menu_kb(deploy_web_url() or None))
+async def send_start(bot, uid, cid):
+    """/start برای همه: کاربری که سلف داره پنل می‌بینه، بقیه دکمه‌ی «ساخت سلف من»."""
+    if is_allowed(uid) and has_session(uid):
+        run = "روشنه 🟢" if is_running(uid) else "خاموشه 🔴"
+        return await bot.send(cid, f"👋 خوش اومدی! سلفت {run}.\nپنل، وضعیت و مینی‌اپ پایینه 👇", ready_kb(uid))
+    await bot.send(cid, START_PUBLIC, public_start_kb(uid))
+
+
+# ───────────── ثبت‌نام باز: هر کس خودکار وارد می‌شه ─────────────
+OPEN_DEFAULT = True
+TRIAL_DEFAULT = 0
+BOT_STATE = {"ok": None, "error": ""}  # وضعیت اتصال بات (برای تشخیص «توکن قبول نمی‌شه»)
+
+
+def is_open() -> bool:
+    return bool(load_reg().get("open", OPEN_DEFAULT))
+
+
+def trial_days() -> int:
+    return int(load_reg().get("trial_days", TRIAL_DEFAULT) or 0)
+
+
+def is_banned(uid) -> bool:
+    return str(uid) in (load_reg().get("banned") or [])
+
+
+def set_open(value: bool):
+    reg = load_reg()
+    reg["open"] = bool(value)
+    save_reg(reg)
+
+
+def set_trial(days: int):
+    reg = load_reg()
+    reg["trial_days"] = max(0, int(days))
+    save_reg(reg)
+
+
+def ban_user(uid):
+    reg = load_reg()
+    if str(uid) not in (reg.get("banned") or []):
+        reg.setdefault("banned", []).append(str(uid))
+        save_reg(reg)
+
+
+def unban_user(uid):
+    reg = load_reg()
+    if str(uid) in (reg.get("banned") or []):
+        reg["banned"].remove(str(uid))
+        save_reg(reg)
+
+
+async def ensure_access(bot, msg) -> bool:
+    """True = این کاربر می‌تونه ادامه بده. ثبت‌نام باز: کاربر جدید خودکار ثبت می‌شه (دوره‌ی آزمایشی اختیاری)؛
+    بسته: درخواست برای ادمین می‌ره. اشتراک تموم‌شده: درخواست تمدید. مسدودشده: رد."""
+    user, chat = msg["from"], msg["chat"]["id"]
+    uid = user["id"]
+    if is_allowed(uid):
         return True
-    if cmd == "/deploy_status":
-        await cmd_deploy_status(bot, uid, cid, arg)
-        return True
-    if cmd == "/redeploy":
-        await cmd_redeploy(bot, uid, cid, arg)
-        return True
-    if cmd == "/forget":
-        await cmd_forget(bot, uid, cid, arg)
-        return True
-    if cmd == "/cancel":
-        if uid in DEPLOY_STATE:
-            DEPLOY_STATE.pop(uid, None)
-            await bot.send(cid, "دیپلوی لغو شد. توکنی ذخیره نشد.")
-            return True
-        if uid in LOGIN:
-            await cleanup_login(uid)
-            await bot.send(cid, "لغو شد.")
-            return True
+    if is_banned(uid):
+        await bot.send(chat, "⛔ دسترسی‌ت توسط ادمین بسته شده.")
         return False
+    if get_entry(uid) is not None:  # قبلاً کاربر بوده و اشتراکش تموم شده
+        await request_access(bot, msg)
+        return False
+    if is_open():
+        name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
+        allow_user(uid, name, trial_days())
+        if ADMIN:
+            try:
+                un = f"@{user['username']}" if user.get("username") else "—"
+                await bot.send(ADMIN, f"👤 کاربر جدید: {html.escape(name)} {html.escape(un)} <code>{uid}</code>")
+            except Exception:  # noqa
+                pass
+        return True
+    await request_access(bot, msg)
     return False
+
+
+async def announce_ready(uid, chat):
+    """بعد از ورود موفق: صبر می‌کنه تا سلف واقعاً بالا بیاد و خبر می‌ده (ساخت/اجرای خودکار)."""
+    bot = _bot_ref.get("bot")
+    if not bot:
+        return
+    for _ in range(45):  # حدود ۹۰ ثانیه
+        await asyncio.sleep(2)
+        inst = INSTANCES.get(uid)
+        if inst and inst.failed:
+            break
+        st = read_status(uid)
+        if st and time.time() - st.get("ts", 0) < 40:
+            if st.get("authorized"):
+                return await bot.send(chat, READY_TEXT, ready_kb(uid))
+            break  # سلف بالا اومد ولی سشن معتبر نیست
+    try:
+        await bot.send(chat, "⚠️ سلفت هنوز آماده نشد. /status رو بزن؛ اگه مشکل موند /restart، و اگه باز هم نشد "
+                             "/disconnect و دوباره /connect.")
+    except Exception:  # noqa
+        pass
+
 CONSENT = (
     "⚠️ <b>قبل از وصل کردن اکانت بخون</b>\n\n"
     "• اکانتت روی سرور این هاب اجرا می‌شه و سشن ورودت اونجا ذخیره می‌شه؛ یعنی ادمین سرور از نظر فنی به اون دسترسی داره.\n"
@@ -1058,8 +1073,8 @@ async def finish_login(bot, uid, chat):
     except Exception:  # noqa
         pass
     await bot.send(chat, f"✅ وصل شد: <b>{html.escape(name)}</b>\n\n"
-                         "سلفت داره بالا میاد (حدود ۱۰ ثانیه). /status و /panel رو بزن.\n"
-                         "بعدش توی یه چت میویی <code>.میویی</code> یا <code>.ماهیگیری</code> بزن.")
+                         "⏳ دارم سلفت رو می‌سازم و راه می‌اندازم (حدود ۱۰ تا ۳۰ ثانیه)؛ آماده شد همین‌جا خبرت می‌کنم.")
+    asyncio.create_task(announce_ready(uid, chat))
 
 
 # ───────────── دستورها ─────────────
@@ -1183,9 +1198,6 @@ async def cmd_cancel(bot, uid, chat, arg):
     if uid in LOGIN:
         await cleanup_login(uid)
         return await bot.send(chat, "لغو شد.")
-    if uid in DEPLOY_STATE:
-        DEPLOY_STATE.pop(uid, None)
-        return await bot.send(chat, "دیپلوی لغو شد. توکنی ذخیره نشد.")
     await bot.send(chat, "چیزی برای لغو نیست.")
 
 
@@ -1249,10 +1261,28 @@ async def cmd_revoke(bot, uid, chat, arg):
     reg = load_reg()
     reg["allowed"].pop(str(target), None)
     save_reg(reg)
+    ban_user(target)  # توی ثبت‌نام باز، کاربرِ گرفته‌شده‌ی دسترسی خودکار دوباره ثبت نشه (/allow آزادش می‌کنه)
     inst = INSTANCES.get(target)
     if inst:
         await inst.stop()
     await bot.send(chat, f"✅ دسترسی <code>{target}</code> گرفته شد و سلفش متوقف شد (اطلاعاتش می‌مونه؛ حذف کامل: خودش /disconnect بزنه)")
+
+
+async def cmd_open(bot, uid, chat, arg):
+    """/open on|off ← ثبت‌نام باز · /open trial <روز> ← دوره‌ی آزمایشی کاربرهای جدید (۰ = نامحدود)."""
+    parts = arg.lower().split()
+    if parts and parts[0] in ("on", "روشن", "1"):
+        set_open(True)
+    elif parts and parts[0] in ("off", "خاموش", "0"):
+        set_open(False)
+    elif len(parts) == 2 and parts[0] in ("trial", "آزمایشی") and parts[1].isdigit():
+        set_trial(int(parts[1]))
+    elif parts:
+        return await bot.send(chat, "مثال: <code>/open on</code> · <code>/open off</code> · <code>/open trial 7</code>")
+    t = trial_days()
+    await bot.send(chat, f"🚪 ثبت‌نام باز: <b>{'روشن ✅ (هر کس خودکار ثبت می‌شه)' if is_open() else 'خاموش 🔒 (فقط با تأیید تو)'}</b>\n"
+                         f"🎁 دوره‌ی آزمایشی: <b>{str(t) + ' روز' if t else 'نامحدود'}</b>\n"
+                         f"👥 ظرفیت: {len(connected_users())}/{MAX_USERS}")
 
 
 async def cmd_broadcast(bot, uid, chat, arg):
@@ -1346,184 +1376,20 @@ async def cmd_dump(bot, uid, chat, arg):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def deploy_web_url() -> str:
-    base = (DOMAIN or "").rstrip("/")
-    return (base + "/deploy") if base else ""
 
 
-async def cmd_deploy(bot, uid, chat, arg):
-    """منوی دیپلوی روی اکانت خود کاربر + شروع فلوی خودکار."""
-    a = (arg or "").strip().lower()
-    if a in ("status", "وضعیت"):
-        return await cmd_deploy_status(bot, uid, chat, "")
-    await bot.send(chat, deploy_menu_text(deploy_web_url()), deploy_menu_kb(deploy_web_url() or None))
 
 
-async def cmd_deploy_status(bot, uid, chat, arg):
-    rec = deploy_record(uid)
-    if not rec:
-        return await bot.send(chat, "هنوز دیپلویی ثبت نکردی. با /deploy شروع کن 🚀")
-    token = load_deploy_token(uid)
-    lines = [
-        "📊 <b>وضعیت دیپلوی تو</b>",
-        f"📦 ریپو: <code>{html.escape(rec.get('repo', SELF_REPO))}</code>",
-        f"🆔 پروژه: <code>{html.escape(rec.get('projectId', '-'))}</code>",
-    ]
-    if rec.get("domain"):
-        lines.append(f"🌐 دامنه: https://{html.escape(rec['domain'])}")
-        lines.append(f"پنل وب: https://{html.escape(rec['domain'])} (رمز پنلی که موقع دیپلوی دادی)")
-    else:
-        lines.append("🌐 دامنه: هنوز گرفته نشده (از داشبورد Railway ← Generate Domain)")
-    if not token:
-        lines.append("\n⚠️ توکن ذخیره نشده؛ برای چک زنده اول دوباره توکن رو با /deploy بده یا /forget رو ببین.")
-        return await bot.send(chat, "\n".join(lines))
-    try:
-        deps = await railway.deployment_status(token, rec["projectId"], rec["serviceId"])
-    except railway.RailwayError as e:
-        return await bot.send(chat, "\n".join(lines) + f"\n\n❌ چک وضعیت نشد: {html.escape(str(e))[:250]}")
-    if not deps:
-        lines.append("🚀 هنوز دیپلویی ثبت نشده (چند دقیقه بعد دوباره بزن).")
-    else:
-        for d in deps[:3]:
-            lines.append(f"• <code>{html.escape(str(d.get('id', ''))[:8])}</code> — {html.escape(str(d.get('status', '?')))}")
-    await bot.send(chat, "\n".join(lines))
 
 
-async def cmd_redeploy(bot, uid, chat, arg):
-    rec = deploy_record(uid)
-    token = load_deploy_token(uid)
-    if not rec or not token:
-        return await bot.send(chat, "اول با /deploy یه دیپلوی بساز (توکن لازمه).")
-    try:
-        await railway.trigger_deploy(token, rec["serviceId"], rec["environmentId"])
-    except railway.RailwayError as e:
-        return await bot.send(chat, f"❌ ریدیپلوی نشد: {html.escape(str(e))[:300]}")
-    await bot.send(chat, "🔄 ریدیپلوی استارت شد. چند دقیقه بعد /deploy_status بزن.")
 
 
-async def cmd_forget(bot, uid, chat, arg):
-    DEPLOY_STATE.pop(uid, None)
-    forget_deploy_token(uid)
-    await bot.send(chat, "🗑 توکن Railway ذخیره‌شده‌ات پاک شد. رکورد دیپلوی (آیدی پروژه/دامنه) می‌مونه.")
 
 
-async def start_deploy_flow(bot, uid, chat):
-    purge_deploy_states()
-    DEPLOY_STATE[uid] = {"step": "token", "ts": time.time(), "chat": chat}
-    await bot.send(chat,
-                   "🚀 <b>دیپلوی خودکار روی اکانت خودت</b>\n\n"
-                   "۱️⃣ برو <b>railway.com/account/tokens</b> و یه <b>Account Token</b> بساز.\n"
-                   "۲️⃣ همین‌جا بفرستش (پیامت بعد خوندن پاک می‌شه).\n\n"
-                   "⚠️ توکن مثل رمزه؛ به هیچ‌کس نده. لغو: /cancel",
-                   {"inline_keyboard": [[botpanel.btn("❌ لغو", "dp:cancel", "danger")]]})
 
 
-async def handle_deploy_step(bot, msg) -> bool:
-    """اگه کاربر وسط فلوی دیپلویه، پیامش رو مصرف می‌کنه → True."""
-    uid, chat = msg["from"]["id"], msg["chat"]["id"]
-    st = DEPLOY_STATE.get(uid)
-    if not st:
-        return False
-    text = (msg.get("text") or "").strip()
-    if text.startswith("/"):
-        return False
-    st["ts"] = time.time()
-    try:
-        await bot.delete(chat, msg["message_id"])
-    except Exception:  # noqa
-        pass
-    step = st.get("step")
-
-    if step == "token":
-        token = text.strip()
-        if len(token) < 20:
-            await bot.send(chat, "❌ این شبیه توکن نیست. دوباره بفرست (یا /cancel)")
-            return True
-        await bot.send(chat, "⏳ دارم توکن رو چک می‌کنم...")
-        try:
-            me = await railway.validate_token(token)
-        except railway.RailwayError as e:
-            await bot.send(chat, f"❌ توکن قبول نشد: {html.escape(str(e))[:300]}\nدوباره بفرست یا /cancel")
-            return True
-        st.update(token=token, step="panel_pw",
-                  name=me.get("name") or me.get("email") or "")
-        await bot.send(chat,
-                       f"✅ وصله به اکانت <b>{html.escape(st['name'] or 'Railway')}</b>\n\n"
-                       "حالا <b>رمز پنل وب سلف‌ت</b> رو بفرست (حداقل ۶ کاراکتر) — همونی که بعداً با دامنه وارد می‌شی.\n"
-                       "یا بنویس <code>auto</code> تا خودم یه رمز قوی بسازم.")
-        return True
-
-    if step == "panel_pw":
-        pw = text.strip()
-        if pw.lower() in ("auto", "بساز", "خودکار"):
-            pw = secrets.token_urlsafe(9)
-            await bot.send(chat, f"🔑 رمز ساخته شد: <code>{html.escape(pw)}</code>\n(ذخیره‌ش کن؛ با همین وارد پنل وب می‌شی)")
-        if len(pw) < 6:
-            await bot.send(chat, "❌ رمز کوتاهه (حداقل ۶ کاراکتر). دوباره بفرست.")
-            return True
-        st.update(panel_pw=pw, step="api")
-        await bot.send(chat,
-                       "آخرین قدم (اختیاری): <b>API_ID و API_HASH</b> از my.telegram.org رو این‌جوری بفرست:\n"
-                       "<code>12345678 abcdef1234567890abcdef12345678</code>\n\n"
-                       "اگه نداری بنویس <code>skip</code> تا رد بشه (بعداً هم می‌شه توی پنل وب وارد کرد).")
-        return True
-
-    if step == "api":
-        api_id = api_hash = ""
-        if text.strip().lower() not in ("skip", "رد", "-", "no", "نه"):
-            parts = text.split()
-            if len(parts) >= 2 and parts[0].isdigit():
-                api_id, api_hash = parts[0], parts[1]
-            else:
-                await bot.send(chat, "❌ فرمت درست نیست. مثال:\n<code>12345678 abcdef...</code>\nیا بنویس <code>skip</code>")
-                return True
-        try:
-            variables = railway.build_variables(st["panel_pw"], api_id, api_hash)
-        except ValueError as e:
-            await bot.send(chat, f"❌ {html.escape(str(e))}")
-            return True
-        st.update(variables=variables, step="confirm")
-        summ = (f"همه‌چی آماده‌ست ✅\n\n📦 ریپو: <code>{html.escape(SELF_REPO)}</code>\n"
-                f"🔑 رمز پنل: <code>{html.escape(st['panel_pw'])}</code>\n"
-                f"🧩 API: {'دارد' if api_id else 'ندارد (پیش‌فرض)'}\n\n"
-                "با تأیید، روی <b>اکانت خودت</b> پروژه + سرویس + متغیرها + Volume (/data) + دامنه ساخته و دیپلوی می‌شه.")
-        await bot.send(chat, summ, {"inline_keyboard": [
-            [botpanel.btn("✅ تأیید و ساخت", "dp:confirm", "success"),
-             botpanel.btn("❌ لغو", "dp:cancel", "danger")]]})
-        return True
-
-    return False
 
 
-async def confirm_deploy(bot, uid, chat):
-    st = DEPLOY_STATE.get(uid)
-    if not st or st.get("step") != "confirm":
-        return await bot.send(chat, "اول /deploy بزن.")
-    token, variables = st["token"], st["variables"]
-    await bot.send(chat, "🚀 شروع شد؛ قدم‌به‌قدم خبر می‌دم...")
-
-    async def say(t):
-        try:
-            await bot.send(chat, html.escape(t) if "<" not in t else t)
-        except Exception:  # noqa
-            pass
-
-    try:
-        res = await railway.full_deploy(token, variables, repo=SELF_REPO, branch=SELF_BRANCH,
-                                        project_name=f"tg-self-{uid}", progress=say)
-    except railway.RailwayError as e:
-        return await bot.send(chat, f"❌ دیپلوی نشد:\n{html.escape(str(e))[:600]}\n\nدوباره /deploy بزن.")
-    except ValueError as e:
-        return await bot.send(chat, f"❌ {html.escape(str(e))}")
-    save_deploy_record(uid, {**res, "created_at": int(time.time())})
-    save_deploy_token(uid, token)  # برای /deploy_status و /redeploy؛ با /forget پاک می‌شه
-    DEPLOY_STATE.pop(uid, None)
-    dom = res.get("domain")
-    done = (f"✅ <b>سلف‌ت ساخته شد!</b>\n\n🆔 پروژه: <code>{html.escape(res['projectId'])}</code>\n"
-            + (f"🌐 دامنه: https://{html.escape(dom)}\nپنل وب رو باز کن و با رمزت وارد شو، بعد شماره/کد تلگرام رو بزن.\n" if dom
-               else "🌐 دامنه خودکار گرفته نشد؛ توی داشبورد Railway ← سرویس ← Settings ← Networking ← Generate Domain بزن.\n")
-            + "\n📊 چک وضعیت: /deploy_status\n🔄 دیپلوی دوباره: /redeploy\n🗑 حذف توکن ذخیره‌شده: /forget")
-    await bot.send(chat, done)
 
 
 async def cmd_app(bot, uid, chat, arg):
@@ -1893,11 +1759,10 @@ async def qr_wait(bot, uid):
 
 USER_CMDS = {"/panel": cmd_panel, "/status": cmd_status, "/cmd": cmd_cmd, "/restart": cmd_restart, "/stop": cmd_stop,
              "/run": cmd_run, "/disconnect": cmd_disconnect, "/cancel": cmd_cancel, "/backup": cmd_backup,
-             "/backup_full": cmd_backup_full, "/restore": cmd_restore, "/deploy": cmd_deploy,
-             "/deploy_status": cmd_deploy_status, "/redeploy": cmd_redeploy, "/forget": cmd_forget,
+             "/backup_full": cmd_backup_full, "/restore": cmd_restore,
              "/app": cmd_app, "/miniapp": cmd_app}
 ADMIN_CMDS = {"/users": cmd_users, "/allow": cmd_allow, "/extend": cmd_extend, "/revoke": cmd_revoke, "/log": cmd_log,
-              "/broadcast": cmd_broadcast, "/dump": cmd_dump}
+              "/broadcast": cmd_broadcast, "/dump": cmd_dump, "/open": cmd_open}
 
 
 async def handle_manage(bot, uid, cid, mid, qid, action):
@@ -1929,9 +1794,9 @@ async def handle_manage(bot, uid, cid, mid, qid, action):
             return await bot.send(cid, "❌ بکاپ خودکاری برات ثبت نشده. با /backup اول یکی بساز.")
         await bot.send(cid, "✅ " + await do_restore(uid, read_json(p, None)))
         return
-    if action == "deploy":
+    if action == "help":
         await bot.answer(qid)
-        return await bot.edit(cid, mid, deploy_menu_text(deploy_web_url()), deploy_menu_kb(deploy_web_url() or None))
+        return await bot.send(cid, HELP + (ADMIN_HELP if uid == ADMIN else ""))
     if action == "app":
         await bot.answer(qid)
         return await cmd_app(bot, uid, cid, "")
@@ -1963,10 +1828,7 @@ async def on_message(bot, msg):
         return
     uid, cid = msg["from"]["id"], chat["id"]
     text = (msg.get("text") or msg.get("caption") or "").strip()
-    # قدم‌های دیپلوی (توکن/رمز/API) برای همه‌ست — قبل از هر گیتی، و پیام توکن پاک می‌شه
-    if uid in DEPLOY_STATE and not text.startswith("/"):
-        if await handle_deploy_step(bot, msg):
-            return
+    # مراحل ورود (شماره/کد/رمز): قبل از هر چیز؛ پیام‌های حساس بعد از خوندن پاک می‌شن
     if uid in LOGIN and not text.startswith("/") and is_allowed(uid):
         return await handle_login(bot, msg)
     if not text.startswith("/"):
@@ -1974,22 +1836,23 @@ async def on_message(bot, msg):
     cmd, _, arg = text.partition(" ")
     cmd = cmd.split("@")[0].lower()
     arg = arg.strip()
-    # /start فقط خوش‌آمد دیپلویه برای همه — پنل مدیریتی قاطیش نیست (اون فقط با /panel میاد)
     if cmd == "/start":
-        return await send_public_start(bot, cid)
+        return await send_start(bot, uid, cid)
     if cmd == "/help":
-        if uid == ADMIN or is_allowed(uid):
+        if is_allowed(uid):
             return await bot.send(cid, HELP + (ADMIN_HELP if uid == ADMIN else ""))
-        return await bot.send(cid, PUBLIC_HELP, public_start_kb())
-    # دستورهای عمومی دیپلوی برای همه (بدون تأیید ادمین)
-    if cmd in PUBLIC_CMDS:
-        if await handle_public_cmd(bot, uid, cid, cmd, arg):
-            return
+        return await bot.send(cid, PUBLIC_HELP, public_start_kb(uid))
+    if cmd == "/cancel":
+        return await cmd_cancel(bot, uid, cid, arg)
     if uid == ADMIN and msg.get("document") and text.split("@")[0].lower().startswith("/update"):
         return await do_update(bot, uid, cid, msg["document"])
-    # بقیه (هاست روی سرور ادمین) فقط برای تأییدشده‌ها؛ بقیه منوی عمومی می‌گیرن نه سکوت
-    if not is_allowed(uid):
-        return await send_public_start(bot, cid)
+    # دستور ناشناخته: نادیده گرفته می‌شه و کاربر رو ثبت‌نام نمی‌کنه (مثلاً /deploy قدیمی)
+    is_restore_doc = bool(msg.get("document")) and text.split("@")[0].lower().startswith("/restore")
+    if not (cmd == "/connect" or cmd in USER_CMDS or cmd in ADMIN_CMDS or is_restore_doc):
+        return
+    # از اینجا به بعد باید دسترسی داشته باشه؛ ثبت‌نام باز ← خودکار ثبت می‌شه
+    if not await ensure_access(bot, msg):
+        return
     if msg.get("document") and text.split("@")[0].lower().startswith("/restore"):
         # بکاپ کامل زیپ حتی بدون سشن قبلی قبول می‌شه (سشن رو برمی‌گردونه)
         return await restore_from_doc(bot, uid, cid, msg["document"])
@@ -1998,7 +1861,7 @@ async def on_message(bot, msg):
     if cmd in USER_CMDS:
         return await USER_CMDS[cmd](bot, uid, cid, arg)
     if cmd in ADMIN_CMDS and uid == ADMIN:
-        return await ADMIN_CMDS[cmd](bot, uid, arg)
+        return await ADMIN_CMDS[cmd](bot, uid, cid, arg)
 
 
 async def on_callback(bot, q):
@@ -2006,57 +1869,29 @@ async def on_callback(bot, q):
     msg = q.get("message") or {}
     cid, mid = msg.get("chat", {}).get("id"), msg.get("message_id")
     kind, _, rest = data.partition(":")
-    # دکمه‌های عمومی (دیپلوی + شروع) برای همه — بدون نیاز به تأیید
-    if kind == "dp":
-        if rest == "auto":
+    # دکمه‌های عمومی شروع (برای همه؛ ثبت‌نام باز خودکار انجام می‌شه)
+    if kind == "ob":
+        if rest == "go":
             await bot.answer(q["id"])
-            try:
-                await bot.edit(cid, mid, "🚀 شروع دیپلوی...")
-            except Exception:  # noqa
-                pass
-            return await start_deploy_flow(bot, uid, cid)
-        if rest == "manual":
-            await bot.answer(q["id"])
-            return await bot.edit(cid, mid, MANUAL_DEPLOY.format(repo=html.escape(SELF_REPO)),
-                                  {"inline_keyboard": [[botpanel.btn("🔙 بازگشت", "dp:back", "primary")]]})
-        if rest == "back":
-            await bot.answer(q["id"])
-            return await bot.edit(cid, mid, deploy_menu_text(deploy_web_url()), deploy_menu_kb(deploy_web_url() or None))
-        if rest == "confirm":
-            await bot.answer(q["id"], "شروع شد...")
-            return await confirm_deploy(bot, uid, cid)
-        if rest == "cancel":
-            DEPLOY_STATE.pop(uid, None)
-            await bot.answer(q["id"], "لغو شد")
-            return await bot.edit(cid, mid, "دیپلوی لغو شد. توکنی ذخیره نشد.")
-        if rest == "status":
-            await bot.answer(q["id"])
-            return await cmd_deploy_status(bot, uid, cid, "")
-        if rest == "redeploy":
-            await bot.answer(q["id"], "در حال ریدیپلوی...")
-            return await cmd_redeploy(bot, uid, cid, "")
-        if rest == "forget":
-            await bot.answer(q["id"], "پاک شد")
-            forget_deploy_token(uid)
-            return await bot.edit(cid, mid, "🗑 توکن پاک شد.", {"inline_keyboard": []})
-        await bot.answer(q["id"])
-        return
+            if not await ensure_access(bot, {"from": q["from"], "chat": {"id": cid}}):
+                return
+            return await begin_login(bot, uid, cid)
+        return await bot.answer(q["id"])
     if kind == "st":
         if rest == "features":
             await bot.answer(q["id"])
             return await bot.edit(cid, mid, FEATURES_PUBLIC,
-                                  {"inline_keyboard": [[botpanel.btn("🚀 ساخت سلف", "dp:auto", "success")],
+                                  {"inline_keyboard": [[botpanel.btn("🚀 ساخت سلف من", "ob:go", "success")],
                                                        [botpanel.btn("🔙 بازگشت", "st:back", "primary")]]})
         if rest == "help":
             await bot.answer(q["id"])
-            return await bot.edit(cid, mid, PUBLIC_HELP, public_start_kb())
+            return await bot.edit(cid, mid, PUBLIC_HELP, public_start_kb(uid))
         if rest == "back":
             await bot.answer(q["id"])
-            return await bot.edit(cid, mid, START_PUBLIC.format(repo=html.escape(SELF_REPO)), public_start_kb())
-        await bot.answer(q["id"])
-        return
+            return await bot.edit(cid, mid, START_PUBLIC, public_start_kb(uid))
+        return await bot.answer(q["id"])
     if not is_allowed(uid) and not (uid == ADMIN):
-        return await bot.answer(q["id"], "برای این بخش باید سلف خودت رو اول دیپلوی کنی 🚀", )
+        return await bot.answer(q["id"], "اول «🚀 ساخت سلف من» رو بزن (/start)")
     if kind in ("ok", "no") and uid == ADMIN and rest.split(":")[0].isdigit():
         parts = rest.split(":")
         target = int(parts[0])
@@ -2169,7 +2004,7 @@ async def webapp_user(request):
     if not uid:
         return None, web.json_response({"ok": False, "error": "احراز هویت تلگرام نامعتبره؛ مینی‌اپ رو از داخل همین بات باز کن"}, status=401)
     if not is_allowed(uid):
-        return None, web.json_response({"ok": False, "error": "این مینی‌اپ برای سلف‌های روی همین هابه. برای ساخت سلف روی اکانت خودت توی بات /deploy بزن"}, status=403)
+        return None, web.json_response({"ok": False, "error": "هنوز سلفی نساختی. توی بات /start بزن و «ساخت سلف من» رو بزن"}, status=403)
     body["_tg_user"] = tg_user  # اطلاعات امضاشده‌ی تلگرام (اسم/یوزرنیم/عکس) برای fallback
     return (uid, body), None
 
@@ -2207,14 +2042,13 @@ def webapp_snapshot(uid, tg_user=None) -> dict:
     flags = read_flags(uid)
     feats = [{"key": k, "name": FEAT[k]["name"], "emoji": FEAT[k]["emoji"], "toggle": FEAT[k]["toggle"],
               "on": bool(flags.get(k)), "desc": FEAT[k]["desc"]} for k in FEAT if k not in HIDDEN]
-    rec = deploy_record(uid)
     return {
         "uid": uid,
         "mode": "hub",
         "caps": {"run_stop": True, "restore_last": True},
         "me": webapp_profile(uid, tg_user),
         "sub": sub_text(uid),
-        "domain": (rec.get("domain") or "") if rec else "",
+        "domain": DOMAIN.replace("https://", "").replace("http://", ""),
         "has_session": has_session(uid),
         "running": running,
         "failed": bool(inst and inst.failed),
@@ -2361,78 +2195,10 @@ async def serve_app(request):
     return web.Response(text=MINIAPP_HTML, content_type="text/html")
 
 
-DEPLOY_PAGE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>دیپلوی سلف روی Railway خودت</title>
-<link rel="preload" href="/font/vazirmatn.woff2" as="font" type="font/woff2" crossorigin>
-<style>
-@font-face{font-family:"Vazirmatn";src:url(/font/vazirmatn.woff2) format("woff2");font-weight:100 900;font-style:normal;font-display:swap}
-:root{--o1:#ff5a00;--o2:#ff8a1f;--bg:#07070a;--card:#0e0e12;--line:#2b2015;--txt:#f4efe9;--mut:#9a8f84}
-*{box-sizing:border-box}body{margin:0;font-family:Vazirmatn,system-ui,-apple-system,"Segoe UI",Tahoma,"Noto Sans Arabic",sans-serif;line-height:1.7;background:var(--bg);color:var(--txt);padding:22px 14px 40px}
-button{font-family:inherit}
-.card{max-width:480px;margin:0 auto;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px}
-h1{font-size:19px;margin:0 0 6px}p,small{color:var(--mut);font-size:13px;line-height:1.9}
-input{width:100%;padding:12px;margin:6px 0;border-radius:11px;border:1px solid #2c2118;background:#09090c;color:var(--txt);font-size:15px;font-family:inherit}
-button{width:100%;padding:13px;margin-top:8px;border-radius:12px;border:0;font-weight:800;font-size:15px;cursor:pointer;color:#170a00;background:linear-gradient(135deg,var(--o2),var(--o1))}
-button:disabled{opacity:.6}code{color:var(--o2)}.msg{white-space:pre-line;font-size:14px;line-height:1.9;border-radius:11px;padding:10px;margin-top:10px}
-.msg.ok{background:rgba(44,255,133,.08);border:1px solid rgba(44,255,133,.4)}.msg.err{background:rgba(255,60,40,.08);border:1px solid rgba(255,80,60,.4)}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-</style></head><body><div class="card">
-<h1>🚀 دیپلوی سلف روی Railway خودت</h1>
-<p>سلف هیچ‌کس روی اکانت ادمین ساخته نمی‌شه. توکن <b>Railway خودت</b> رو بده تا از ریپوی <code>__REPO__</code> برات پروژه‌ی جدا بسازم: سرویس + متغیرها (PANEL_PASSWORD و...) + Volume روی <code>/data</code> + دامنه + دیپلوی.<br>
-توکن رو از <b>railway.com/account/tokens</b> بساز (Account Token). توکن فقط همین یه بار استفاده می‌شه و ذخیره نمی‌شه.</p>
-<input id="t" placeholder="Railway Account Token" dir="ltr" autocomplete="off">
-<div class="row"><input id="p" placeholder="رمز پنل وب (حداقل ۶ حرف)"><button id="g" type="button" style="background:#1e1e26;color:var(--txt);border:1px solid var(--line)">🎲 ساخت رمز</button></div>
-<div class="row"><input id="a" placeholder="API_ID (اختیاری)" dir="ltr"><input id="h" placeholder="API_HASH (اختیاری)" dir="ltr"></div>
-<button id="b">🚀 بساز و دیپلوی کن</button>
-<div id="m"></div>
-<p>بعدش دامنه‌ای که می‌دم رو باز کن، با رمزت وارد شو و شماره/کد تلگرام رو بزن. اگه خواستی دستی انجام بدی: Railway ← New Project ← Deploy from GitHub ← ریپو <code>__REPO__</code> + متغیرهای بالا + Volume روی <code>/data</code> + Generate Domain.</p>
-</div><script>
-document.getElementById('g').onclick=()=>{const c='abcdefghjkmnpqrstuvwxyz23456789';let s='';for(let i=0;i<12;i++)s+=c[Math.floor(Math.random()*c.length)];document.getElementById('p').value=s;};
-document.getElementById('b').onclick=async()=>{const m=document.getElementById('m');const b=document.getElementById('b');
-const body={token:document.getElementById('t').value.trim(),panel_password:document.getElementById('p').value,api_id:document.getElementById('a').value.trim(),api_hash:document.getElementById('h').value.trim()};
-if(body.token.length<20){m.innerHTML='<div class=\"msg err\">توکن کوتاهه.</div>';return;}
-if((body.panel_password||'').length<6){m.innerHTML='<div class=\"msg err\">رمز پنل حداقل ۶ کاراکتر.</div>';return;}
-b.disabled=true;m.innerHTML='<div class=\"msg\">⏳ دارم می‌سازم... (۱-۳ دقیقه طول می‌کشه، صفحه رو نبند)</div>';
-try{const r=await fetch('/api/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-const j=await r.json();if(!r.ok)throw new Error(j.error||('خطا '+r.status));
-m.innerHTML='<div class=\"msg ok\">✅ ساخته شد!\\n🌐 دامنه: https://'+j.domain+'\\nپنل وب رو باز کن و با رمزت وارد شو.\\n\\nوضعیت: '+j.status+'</div>';document.getElementById('t').value='';}
-catch(e){m.innerHTML='<div class=\"msg err\">❌ '+String(e.message||e).slice(0,600)+'</div>';}b.disabled=false;};
-</script></body></html>""".replace("__REPO__", SELF_REPO)
 
 
-async def serve_deploy(request):
-    return web.Response(text=DEPLOY_PAGE, content_type="text/html")
 
 
-async def api_deploy(request):
-    """دیپلوی از فرم وب: توکن فقط همین یه بار استفاده می‌شه، ذخیره نمی‌شه."""
-    try:
-        body = await request.json()
-    except Exception:  # noqa
-        return web.json_response({"ok": False, "error": "bad json"}, status=400)
-    token = str(body.get("token", "")).strip()
-    panel_pw = str(body.get("panel_password", "") or "")
-    api_id = str(body.get("api_id", "") or "").strip()
-    api_hash = str(body.get("api_hash", "") or "").strip()
-    if len(token) < 20:
-        return web.json_response({"ok": False, "error": "توکن معتبر نیست"}, status=400)
-    try:
-        variables = railway.build_variables(panel_pw, api_id, api_hash)
-    except ValueError as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=400)
-    try:
-        await railway.validate_token(token)
-    except railway.RailwayError as e:
-        return web.json_response({"ok": False, "error": str(e)[:300]}, status=400)
-    try:
-        res = await railway.full_deploy(token, variables, repo=SELF_REPO, branch=SELF_BRANCH,
-                                        project_name="tg-self")
-    except railway.RailwayError as e:
-        return web.json_response({"ok": False, "error": str(e)[:500]}, status=400)
-    # عمداً توکن رو برنمی‌گردونیم و ذخیره نمی‌کنیم
-    return web.json_response({"ok": True, "domain": res.get("domain") or "",
-                              "projectId": res.get("projectId"), "status": "دیپلوی استارت شد؛ چند دقیقه بعد دامنه رو باز کن"})
 
 
 async def handle_update(bot, u):
@@ -2443,14 +2209,11 @@ async def handle_update(bot, u):
 
 
 BOT_COMMANDS = [
+    {"command": "start", "description": "🚀 شروع / ساخت سلف من"},
     {"command": "panel", "description": "🎛 پنل مدیریتی (روشن/خاموش، قابلیت‌ها، بکاپ)"},
     {"command": "status", "description": "📊 وضعیت سلف"},
     {"command": "app", "description": "📱 مینی‌اپ (کنترل لمسی)"},
     {"command": "connect", "description": "🔌 وصل کردن اکانت"},
-    {"command": "deploy", "description": "🚀 دیپلوی روی Railway خودت (با توکن خودت)"},
-    {"command": "deploy_status", "description": "📊 وضعیت دیپلوی Railway من"},
-    {"command": "redeploy", "description": "🔄 دیپلوی دوباره"},
-    {"command": "forget", "description": "🗑 حذف توکن Railway ذخیره‌شده"},
     {"command": "cmd", "description": "⚡ اجرای دستور (مثال: /cmd me .میویی)"},
     {"command": "run", "description": "🟢 روشن کردن سلف"},
     {"command": "stop", "description": "🔴 خاموش کردن سلف"},
@@ -2483,13 +2246,13 @@ async def poll(app):
                 bot = Bot(s)
                 _bot_ref["bot"] = bot
                 me = await bot.api("getMe")
+                BOT_STATE.update(ok=True, error="")
                 await bot.api("deleteWebhook")
                 log.info("hub bot: @%s admin=%s", me.get("username"), ADMIN)
                 await setup_bot_menu(bot)
                 offset = None
                 while True:
                     await purge_logins()
-                    purge_deploy_states()
                     ups = await bot.api("getUpdates", offset=offset, timeout=25, allowed_updates=["message", "callback_query"])
                     for u in ups:
                         offset = u["update_id"] + 1
@@ -2500,9 +2263,16 @@ async def poll(app):
         except asyncio.CancelledError:
             raise
         except botpanel.BotError as e:
-            log.warning("hub bot: %s", e)
+            if e.code in (401, 404):
+                BOT_STATE.update(ok=False, error="توکن بات نامعتبره: HUB_BOT_TOKEN اشتباهه یا BotFather باطلش کرده (/revoke). "
+                                                 "توکن جدید رو دقیق کپی کن (بدون فاصله و گیومه).")
+                log.error("hub bot token rejected by Telegram: %s", e)
+            else:
+                BOT_STATE.update(ok=False, error=f"خطای Bot API: {e}")
+                log.warning("hub bot: %s", e)
             await asyncio.sleep(60 if e.code in (401, 404) else 10)
         except Exception as e:  # noqa
+            BOT_STATE.update(ok=False, error=f"اتصال به تلگرام برقرار نشد: {type(e).__name__}")
             log.warning("hub bot: %r", e)
             await asyncio.sleep(10)
 
@@ -2719,7 +2489,7 @@ async def health(request):
     wants_html = "text/html" in request.headers.get("Accept", "") and request.query.get("json") != "1"
     if wants_html:  # مرورگر: صفحه‌ی خوشامد + راهنمای ورود؛ healthcheck/curl همچنان JSON می‌گیره
         return web_html(weblogin.landing_page(bot_username()))
-    return web.json_response({"hub": True, "single_bot": True,
+    return web.json_response({"hub": True, "single_bot": True, "bot": dict(BOT_STATE), "open": is_open(),
                               "running": sum(1 for i in INSTANCES.values() if i.running),
                               "users": len(connected_users()), "app": bool(app_base_url())})
 
@@ -2748,8 +2518,6 @@ def main():
         web.get("/font/vazirmatn.woff2", miniapp.serve_font),
         web.get("/login", web_login_page),
         web.post("/login/{action}", web_login_post),
-        web.get("/deploy", serve_deploy),
-        web.post("/api/deploy", api_deploy),
         web.post("/api/me", api_me),
         web.post("/api/toggle", api_toggle),
         web.post("/api/control", api_control),
